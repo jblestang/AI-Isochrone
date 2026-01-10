@@ -1,0 +1,347 @@
+#[cfg(feature = "gui")]
+mod gui_impl {
+    use eframe::egui;
+    use crate::types::{Point, Isochrone};
+    use std::sync::Arc;
+    use poll_promise::Promise;
+    use image::DynamicImage;
+
+    /// Application GUI pour visualiser les isochrones
+    pub struct IsochroneApp {
+        pub isochrones: Vec<Isochrone>,
+        pub start: Point,
+        pub destination: Option<Point>,
+        
+        // Paramètres de la carte
+        center_lat: f64,
+        center_lon: f64,
+        zoom: u8,
+        
+        // Cache de tuiles
+        tile_cache: std::collections::HashMap<(u8, u32, u32), Arc<Promise<Option<egui::ColorImage>>>>,
+        
+        // État de la vue
+        pan_start: Option<egui::Pos2>,
+        view_center: egui::Vec2,
+    }
+
+    impl IsochroneApp {
+        pub fn new(isochrones: Vec<Isochrone>, start: Point, destination: Option<Point>) -> Self {
+            let center_lat = start.lat;
+            let center_lon = start.lon;
+            
+            Self {
+                isochrones,
+                start,
+                destination,
+                center_lat,
+                center_lon,
+                zoom: 9,
+                tile_cache: std::collections::HashMap::new(),
+                pan_start: None,
+                view_center: egui::Vec2::ZERO,
+            }
+        }
+        
+        /// Convertit une coordonnée géographique (lat, lon) en coordonnées écran
+        fn geo_to_screen(&self, lat: f64, lon: f64, rect: &egui::Rect, tile_size: f32) -> egui::Pos2 {
+            let n = 2.0_f64.powi(self.zoom as i32);
+            let x = (lon + 180.0) / 360.0 * n as f64;
+            let lat_rad = lat.to_radians();
+            let y = (1.0 - ((lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0 * n as f64;
+            
+            let center_x = (self.center_lon + 180.0) / 360.0 * n as f64;
+            let center_lat_rad = self.center_lat.to_radians();
+            let center_y = (1.0 - ((center_lat_rad.tan() + (1.0 / center_lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0 * n as f64;
+            
+            let dx = (x - center_x) * tile_size as f64;
+            let dy = (y - center_y) * tile_size as f64;
+            
+            egui::Pos2::new(
+                rect.center().x + dx as f32 + self.view_center.x,
+                rect.center().y + dy as f32 + self.view_center.y,
+            )
+        }
+        
+        /// Obtient une tuile de carte OpenSeaMap (avec fallback OpenStreetMap)
+        fn get_tile(&mut self, z: u8, x: u32, y: u32) -> Arc<Promise<Option<egui::ColorImage>>> {
+            let key = (z, x, y);
+            
+            if let Some(promise) = self.tile_cache.get(&key) {
+                return Arc::clone(promise);
+            }
+            
+            let promise = Promise::spawn_thread("load_tile", move || {
+                // Essayer d'abord OpenSeaMap, puis fallback sur OpenStreetMap
+                let url = format!("https://tiles.openseamap.org/seamark/{}/{}/{}.png", z, x, y);
+                let response = reqwest::blocking::get(&url);
+                
+                let image_data = if let Ok(resp) = response {
+                    if resp.status().is_success() {
+                        resp.bytes().ok()
+                    } else {
+                        // Fallback sur OpenStreetMap
+                        let osm_url = format!("https://tile.openstreetmap.org/{}/{}/{}.png", z, x, y);
+                        reqwest::blocking::get(&osm_url)
+                            .ok()
+                            .and_then(|r| r.bytes().ok())
+                    }
+                } else {
+                    // Fallback direct sur OpenStreetMap
+                    let osm_url = format!("https://tile.openstreetmap.org/{}/{}/{}.png", z, x, y);
+                    reqwest::blocking::get(&osm_url)
+                        .ok()
+                        .and_then(|r| r.bytes().ok())
+                };
+                
+                if let Some(data) = image_data {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let pixels = rgba.as_flat_samples().samples;
+                        let pixels: Vec<egui::Color32> = pixels
+                            .chunks_exact(4)
+                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                            .collect();
+                        Some(egui::ColorImage { size, pixels })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            
+            let promise_arc = Arc::new(promise);
+            self.tile_cache.insert(key, Arc::clone(&promise_arc));
+            promise_arc
+        }
+        
+        /// Dessine les tuiles de carte nécessaires
+        fn draw_map_tiles(&mut self, ui: &mut egui::Ui, rect: &egui::Rect) {
+            let tile_size = 256.0;
+            let n = 2_u32.pow(self.zoom);
+            
+            // Calculer quelles tuiles sont visibles
+            let center_x = ((self.center_lon + 180.0) / 360.0 * n as f64) as u32;
+            let center_lat_rad = self.center_lat.to_radians();
+            let center_y = ((1.0 - ((center_lat_rad.tan() + (1.0 / center_lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0 * n as f64) as u32;
+            
+            let tiles_x = (rect.width() / tile_size).ceil() as u32 + 2;
+            let tiles_y = (rect.height() / tile_size).ceil() as u32 + 2;
+            
+            let start_x = center_x.saturating_sub(tiles_x / 2);
+            let end_x = (center_x + tiles_x / 2).min(n - 1);
+            let start_y = center_y.saturating_sub(tiles_y / 2);
+            let end_y = (center_y + tiles_y / 2).min(n - 1);
+            
+            for y in start_y..=end_y {
+                for x in start_x..=end_x {
+                    let promise = self.get_tile(self.zoom, x, y);
+                    
+                    if let Some(result) = promise.ready() {
+                        if let Some(color_image) = result {
+                            let texture = ui.ctx().load_texture(
+                                format!("tile_{}_{}_{}", self.zoom, x, y),
+                                color_image.clone(),
+                                egui::TextureOptions::LINEAR
+                            );
+                            
+                            let tile_x = rect.center().x + (x as f32 - center_x as f32) * tile_size + self.view_center.x;
+                            let tile_y = rect.center().y + (y as f32 - center_y as f32) * tile_size + self.view_center.y;
+                            
+                            let tile_rect = egui::Rect::from_min_size(
+                                egui::Pos2::new(tile_x, tile_y),
+                                egui::Vec2::splat(tile_size),
+                            );
+                            
+                            // Dessiner la texture avec le painter
+                            ui.painter().image(
+                                texture.id(),
+                                tile_rect,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    } else {
+                        // Afficher un placeholder pendant le chargement
+                        let tile_x = rect.center().x + (x as f32 - center_x as f32) * tile_size + self.view_center.x;
+                        let tile_y = rect.center().y + (y as f32 - center_y as f32) * tile_size + self.view_center.y;
+                        
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::Pos2::new(tile_x, tile_y),
+                                egui::Vec2::splat(tile_size),
+                            ),
+                            0.0,
+                            egui::Color32::from_gray(200),
+                        );
+                    }
+                }
+            }
+        }
+        
+        /// Dessine les isochrones
+        fn draw_isochrones(&self, ui: &egui::Ui, rect: &egui::Rect) {
+            let tile_size = 256.0;
+            let colors = [
+                egui::Color32::from_rgb(255, 0, 0),     // Rouge pour 1h
+                egui::Color32::from_rgb(255, 100, 0),   // Orange pour 2h
+                egui::Color32::from_rgb(255, 200, 0),   // Jaune pour 3h
+                egui::Color32::from_rgb(200, 255, 0),   // Vert-jaune pour 4h
+                egui::Color32::from_rgb(100, 255, 0),   // Vert pour 5h+
+            ];
+            
+            for (idx, isochrone) in self.isochrones.iter().enumerate() {
+                if isochrone.points.len() < 3 {
+                    continue;
+                }
+                
+                // Couleur basée sur l'heure (cyclique)
+                let color_idx = (idx % colors.len()) as usize;
+                let color = colors[color_idx].linear_multiply(0.3); // Transparence
+                
+                // Dessiner le polygone
+                let points: Vec<egui::Pos2> = isochrone.points
+                    .iter()
+                    .map(|p| self.geo_to_screen(p.lat, p.lon, rect, tile_size))
+                    .collect();
+                
+                if !points.is_empty() {
+                    // Fermer le polygone
+                    let mut closed_points = points.clone();
+                    if let Some(&first) = points.first() {
+                        closed_points.push(first);
+                    }
+                    
+                    // Dessiner le remplissage
+                    ui.painter().add(egui::Shape::closed_line(
+                        closed_points.clone(),
+                        egui::Stroke::new(2.0, color),
+                    ));
+                    
+                    // Dessiner le contour
+                    ui.painter().add(egui::Shape::line(
+                        closed_points,
+                        egui::Stroke::new(1.0, color.linear_multiply(1.5)),
+                    ));
+                    
+                    // Afficher l'heure si c'est la dernière isochrone ou toutes les 4h
+                    if idx == self.isochrones.len() - 1 || idx % 4 == 0 {
+                        if let Some(&center) = points.get(points.len() / 2) {
+                            ui.painter().text(
+                                center,
+                                egui::Align2::CENTER_CENTER,
+                                format!("{:.0}h", isochrone.time_hours),
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl eframe::App for IsochroneApp {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Contrôles
+                ui.horizontal(|ui| {
+                    ui.label("Zoom:");
+                    if ui.button("-").clicked() && self.zoom > 1 {
+                        self.zoom -= 1;
+                        self.tile_cache.clear(); // Vider le cache quand on change de zoom
+                    }
+                    ui.label(format!("{}", self.zoom));
+                    if ui.button("+").clicked() && self.zoom < 18 {
+                        self.zoom += 1;
+                        self.tile_cache.clear();
+                    }
+                    
+                    ui.separator();
+                    
+                    if ui.button("Réinitialiser vue").clicked() {
+                        self.center_lat = self.start.lat;
+                        self.center_lon = self.start.lon;
+                        self.view_center = egui::Vec2::ZERO;
+                        self.tile_cache.clear();
+                    }
+                    
+                    ui.separator();
+                    
+                    ui.label(format!("Isochrones: {}", self.isochrones.len()));
+                });
+                
+                ui.separator();
+                
+                // Zone de la carte
+                let map_rect = ui.available_rect_before_wrap();
+                let response = ui.interact(map_rect, ui.id(), egui::Sense::drag());
+                
+                // Gestion du pan (déplacement de la carte)
+                if response.drag_started() {
+                    self.pan_start = Some(response.interact_pointer_pos().unwrap());
+                }
+                
+                if let Some(start_pos) = self.pan_start {
+                    if let Some(current_pos) = response.interact_pointer_pos() {
+                        let delta = current_pos - start_pos;
+                        if response.dragged() {
+                            self.view_center += delta;
+                            self.pan_start = Some(current_pos);
+                        }
+                        if response.drag_released() {
+                            self.pan_start = None;
+                        }
+                    }
+                }
+                
+                // Gestion du zoom avec la molette
+                if let Some(pos) = ctx.pointer_latest_pos() {
+                    if map_rect.contains(pos) {
+                        let zoom_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                        if zoom_delta != 0.0 {
+                            let old_zoom = self.zoom;
+                            if zoom_delta > 0.0 && self.zoom < 18 {
+                                self.zoom += 1;
+                            } else if zoom_delta < 0.0 && self.zoom > 1 {
+                                self.zoom -= 1;
+                            }
+                            
+                            if self.zoom != old_zoom {
+                                // Ajuster le view_center pour zoomer vers la souris
+                                let mouse_pos: egui::Vec2 = pos.to_vec2() - map_rect.center().to_vec2();
+                                let scale = if zoom_delta > 0.0 { 2.0 } else { 0.5 };
+                                self.view_center = (self.view_center + mouse_pos) * scale - mouse_pos;
+                                self.tile_cache.clear();
+                            }
+                        }
+                    }
+                }
+                
+                // Dessiner la carte
+                ui.painter().rect_filled(map_rect, 0.0, egui::Color32::from_gray(240));
+                self.draw_map_tiles(ui, &map_rect);
+                
+                // Dessiner les isochrones
+                self.draw_isochrones(ui, &map_rect);
+                
+                // Dessiner le point de départ
+                let start_pos = self.geo_to_screen(self.start.lat, self.start.lon, &map_rect, 256.0);
+                ui.painter().circle_filled(start_pos, 8.0, egui::Color32::GREEN);
+                ui.painter().circle_stroke(start_pos, 10.0, egui::Stroke::new(2.0, egui::Color32::DARK_GREEN));
+                
+                // Dessiner le point d'arrivée si spécifié
+                if let Some(dest) = self.destination {
+                    let dest_pos = self.geo_to_screen(dest.lat, dest.lon, &map_rect, 256.0);
+                    ui.painter().circle_filled(dest_pos, 8.0, egui::Color32::RED);
+                    ui.painter().circle_stroke(dest_pos, 10.0, egui::Stroke::new(2.0, egui::Color32::DARK_RED));
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+pub use gui_impl::*;
