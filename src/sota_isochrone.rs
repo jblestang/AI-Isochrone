@@ -123,7 +123,7 @@ impl SotaIsochroneRouter {
         let mut heading_map: HashMap<CellKey, f64> = HashMap::new();
         let mut frontier = BinaryHeap::new();
 
-        let start_cell = grid.cell_key(&base.start);
+        let start_cell = grid.cell_containing(&base.start);
         let start_node = SotaNode {
             point: base.start,
             time: 0.0,
@@ -132,10 +132,11 @@ impl SotaIsochroneRouter {
             weighted_cost: 0.0,
             parent_key: None,
         };
-        frontier.push(start_node);
         visited.insert(start_cell, 0.0);
         point_map.insert(start_cell, base.start);
-        let _ = tracker.try_update(base.start, 0.0);
+        let _ = tracker.try_update(base.start, 0.0, &self.landmask);
+
+        frontier.push(start_node);
 
         let mut isochrones: Vec<Isochrone> = Vec::new();
         let mut next_iso_time = base.isochrone_step_hours * 3600.0;
@@ -154,9 +155,7 @@ impl SotaIsochroneRouter {
                 break;
             }
 
-            let cell_key = grid
-                .nearest_sea_cell(&node.point)
-                .unwrap_or_else(|| grid.cell_key(&node.point));
+            let cell_key = grid.cell_containing(&node.point);
             let node_key_cost = node.prune_key(self.config.optimize_cost);
 
             if visited.get(&cell_key).copied().unwrap_or(f64::INFINITY) + 1e-6 < node_key_cost {
@@ -184,13 +183,13 @@ impl SotaIsochroneRouter {
                 }
             }
 
-            // Grid strategy: exclude land — only sea grid cells participate.
-            if node.time > 0.0 && !grid.is_sea_cell(cell_key) {
+            // Exclude land points; arrival time is kept at exact coordinates.
+            if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
                 continue;
             }
 
             if node.time > 0.0 {
-                tracker.try_update(node.point, node.time);
+                tracker.try_update(node.point, node.time, &self.landmask);
             }
 
             point_map.insert(cell_key, node.point);
@@ -223,9 +222,10 @@ impl SotaIsochroneRouter {
             }
 
             for succ in self.expand(&node, &grid) {
-                let Some(skey) = grid.nearest_sea_cell(&succ.point) else {
+                if succ.time > 0.0 && !self.landmask.is_sea(&succ.point) {
                     continue;
-                };
+                }
+                let skey = grid.cell_containing(&succ.point);
                 let succ_key_cost = succ.prune_key(self.config.optimize_cost);
                 if succ_key_cost < visited.get(&skey).copied().unwrap_or(f64::INFINITY) {
                     frontier.push(SotaNode {
@@ -284,7 +284,7 @@ impl SotaIsochroneRouter {
         }
     }
 
-    fn expand(&self, node: &SotaNode, grid: &RoutingGrid) -> Vec<SotaNode> {
+    fn expand(&self, node: &SotaNode, _grid: &RoutingGrid) -> Vec<SotaNode> {
         let base = &self.config.base;
         let step_seconds = base.simulation_step_seconds();
         let current_time = self.start_time + Duration::seconds(node.time as i64);
@@ -324,9 +324,6 @@ impl SotaIsochroneRouter {
                 }
 
                 let new_point = move_from_point(&node.point, eff_dir, distance);
-                let Some(_cell_key) = grid.nearest_sea_cell(&new_point) else {
-                    return None;
-                };
                 if node.time > 0.0 && !self.landmask.is_sea(&new_point) {
                     return None;
                 }
@@ -394,7 +391,7 @@ impl SotaIsochroneRouter {
         let headings: Vec<f64> = route
             .iter()
             .filter_map(|p| {
-                let key = grid.cell_key(p);
+                let key = grid.cell_containing(p);
                 heading_map.get(&key).copied()
             })
             .collect();

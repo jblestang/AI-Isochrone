@@ -82,34 +82,18 @@ impl RoutingGrid {
         self.sea_cells.contains(&key)
     }
 
+    /// Index of the grid cell that contains `point` (exact coordinates, no snapping).
+    pub fn cell_containing(&self, point: &Point) -> CellKey {
+        let i = ((point.lat - self.spec.min_lat) / self.spec.step_deg).floor() as i32;
+        let j = ((point.lon - self.spec.min_lon) / self.spec.step_deg).floor() as i32;
+        (i, j)
+    }
+
+    /// Rounded cell index (legacy / tests).
     pub fn cell_key(&self, point: &Point) -> CellKey {
         let i = ((point.lat - self.spec.min_lat) / self.spec.step_deg).round() as i32;
         let j = ((point.lon - self.spec.min_lon) / self.spec.step_deg).round() as i32;
         (i, j)
-    }
-
-    /// Nearest sea cell for a point (searches local neighborhood if rounded cell is land).
-    pub fn nearest_sea_cell(&self, point: &Point) -> Option<CellKey> {
-        let base = self.cell_key(point);
-        if self.is_sea_cell(base) {
-            return Some(base);
-        }
-
-        let max_radius = 4i32;
-        for radius in 1..=max_radius {
-            for di in -radius..=radius {
-                for dj in -radius..=radius {
-                    if di.abs() != radius && dj.abs() != radius {
-                        continue;
-                    }
-                    let key = (base.0 + di, base.1 + dj);
-                    if self.is_sea_cell(key) {
-                        return Some(key);
-                    }
-                }
-            }
-        }
-        None
     }
 
     pub fn cell_center(&self, key: CellKey) -> Point {
@@ -158,9 +142,14 @@ impl GridBestTracker {
         self.best_point.get(&key).copied()
     }
 
-    /// Register arrival at the nearest sea grid cell. Returns the cell key if updated.
-    pub fn try_update(&mut self, point: Point, time: f64) -> Option<CellKey> {
-        let key = self.grid.nearest_sea_cell(&point)?;
+    /// Register arrival at exact `point` coordinates, binned into the containing grid cell.
+    /// Returns the cell key if this is the best (earliest) arrival for that cell.
+    pub fn try_update(&mut self, point: Point, time: f64, landmask: &Landmask) -> Option<CellKey> {
+        if time > 0.0 && !landmask.is_sea(&point) {
+            return None;
+        }
+
+        let key = self.grid.cell_containing(&point);
         if time + 1e-6 >= self.best_time(key) {
             return None;
         }
@@ -229,7 +218,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cell_snapping_rounds_to_nearest() {
+    fn cell_containing_uses_floor_binning() {
+        let spec = GridSpec {
+            min_lat: 47.0,
+            max_lat: 48.0,
+            min_lon: -4.0,
+            max_lon: -3.0,
+            step_deg: 0.5,
+        };
+        let landmask = Landmask::new().unwrap();
+        let grid = RoutingGrid::from_spec(spec, &landmask);
+        assert_eq!(grid.cell_containing(&Point::new(47.74, -3.36)), (1, 1));
+        assert_eq!(grid.cell_containing(&Point::new(47.51, -3.01)), (1, 1));
+    }
+
+    #[test]
+    fn snap_to_cell_rounds_to_nearest_node() {
         let spec = GridSpec {
             min_lat: 47.0,
             max_lat: 48.0,
@@ -246,6 +250,30 @@ mod tests {
     }
 
     #[test]
+    fn tracker_keeps_best_arrival_at_exact_coordinates() {
+        let spec = GridSpec::from_route(
+            Point::new(47.75, -3.37),
+            Some(Point::new(43.12, 5.93)),
+            0.5,
+            1.0,
+        );
+        let landmask = Landmask::new().unwrap();
+        let grid = RoutingGrid::from_spec(spec, &landmask);
+        let mut tracker = GridBestTracker::new(grid);
+
+        let exact = Point::new(47.742, -3.358);
+        if landmask.is_sea(&exact) {
+            tracker.try_update(exact, 3600.0, &landmask);
+            tracker.try_update(exact, 7200.0, &landmask);
+            let key = tracker.grid().cell_containing(&exact);
+            assert_eq!(tracker.best_time(key), 3600.0);
+            let stored = tracker.best_point(key).unwrap();
+            assert!((stored.lat - exact.lat).abs() < 1e-9);
+            assert!((stored.lon - exact.lon).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn tracker_keeps_best_arrival_per_cell() {
         let spec = GridSpec::from_route(
             Point::new(47.75, -3.37),
@@ -258,10 +286,10 @@ mod tests {
         let mut tracker = GridBestTracker::new(grid);
 
         let p = Point::new(47.74, -3.36);
-        if tracker.grid().is_sea_cell(tracker.grid().cell_key(&p)) {
-            tracker.try_update(p, 3600.0);
-            tracker.try_update(p, 7200.0);
-            let key = tracker.grid().cell_key(&p);
+        if landmask.is_sea(&p) {
+            tracker.try_update(p, 3600.0, &landmask);
+            tracker.try_update(p, 7200.0, &landmask);
+            let key = tracker.grid().cell_containing(&p);
             assert_eq!(tracker.best_time(key), 3600.0);
         }
     }

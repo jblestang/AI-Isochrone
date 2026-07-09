@@ -93,9 +93,9 @@ impl IsochroneCalculator {
             distance: 0.0,
         };
         frontier.push(start_node);
-        let start_cell = grid.cell_key(&self.config.start);
+        let start_cell = grid.cell_containing(&self.config.start);
         visited.insert(start_cell, 0.0);
-        let _ = tracker.try_update(self.config.start, 0.0);
+        let _ = tracker.try_update(self.config.start, 0.0, &self.landmask);
 
         let mut isochrones = Vec::new();
         let mut next_isochrone_time = self.config.isochrone_step_hours * 3600.0;
@@ -113,20 +113,18 @@ impl IsochroneCalculator {
                 break;
             }
 
-            let cell_key = grid
-                .nearest_sea_cell(&node.point)
-                .unwrap_or_else(|| grid.cell_key(&node.point));
+            let cell_key = grid.cell_containing(&node.point);
             if visited.get(&cell_key).copied().unwrap_or(f64::INFINITY) + 1e-6 < node.time {
                 continue;
             }
             visited.insert(cell_key, node.time);
 
-            if node.time > 0.0 && !grid.is_sea_cell(cell_key) {
+            if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
                 continue;
             }
 
             if node.time > 0.0 {
-                tracker.try_update(node.point, node.time);
+                tracker.try_update(node.point, node.time, &self.landmask);
             }
 
             if node.time >= next_isochrone_time {
@@ -143,9 +141,10 @@ impl IsochroneCalculator {
             }
 
             for successor in self.explore_directions(&node, &grid) {
-                let Some(skey) = grid.nearest_sea_cell(&successor.point) else {
+                if successor.time > 0.0 && !self.landmask.is_sea(&successor.point) {
                     continue;
-                };
+                }
+                let skey = grid.cell_containing(&successor.point);
                 if successor.time < visited.get(&skey).copied().unwrap_or(f64::INFINITY) {
                     frontier.push(successor);
                 }
@@ -168,7 +167,7 @@ impl IsochroneCalculator {
     }
 
     /// Explore toutes les directions possibles depuis un nœud
-    fn explore_directions(&self, node: &Node, grid: &RoutingGrid) -> Vec<Node> {
+    fn explore_directions(&self, node: &Node, _grid: &RoutingGrid) -> Vec<Node> {
         let step_seconds = self.config.simulation_step_seconds();
         let current_time = self.start_time + Duration::seconds(node.time as i64);
         
@@ -204,9 +203,6 @@ impl IsochroneCalculator {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, candidate)| {
-                    if grid.nearest_sea_cell(&candidate.point).is_none() {
-                        return None;
-                    }
                     if node.time > 0.0 && !are_sea.get(idx).copied().unwrap_or(false) {
                         return None;
                     }
