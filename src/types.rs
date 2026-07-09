@@ -1,7 +1,8 @@
 use ordered_float::OrderedFloat;
+use serde::{Deserialize, Serialize};
 
 /// Point géographique avec latitude et longitude
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Point {
     pub lat: f64,
     pub lon: f64,
@@ -104,14 +105,75 @@ pub struct NodeState {
 }
 
 /// Isochrone : ensemble de points atteignables à un temps donné
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Isochrone {
     pub time_hours: f64,
     pub points: Vec<Point>,
 }
 
+/// Sea state from GRIB/BUFR wave models
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SeaState {
+    pub significant_wave_height_m: f64,
+    pub wave_period_s: f64,
+    /// Direction waves are coming FROM (meteorological convention)
+    pub wave_direction_deg: f64,
+}
+
+impl SeaState {
+    pub fn new(hs: f64, period: f64, direction: f64) -> Self {
+        Self {
+            significant_wave_height_m: hs,
+            wave_period_s: period,
+            wave_direction_deg: direction % 360.0,
+        }
+    }
+}
+
+/// Extended configuration for SOTA multi-criteria isochrone routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SotaRoutingConfig {
+    pub base: IsochroneConfig,
+    /// Arrival envelope time band width in minutes
+    pub envelope_step_minutes: f64,
+    /// Radius around destination to consider "arrived" (meters)
+    pub arrival_radius_m: f64,
+    /// Use composite cost J instead of pure time for pruning
+    pub optimize_cost: bool,
+}
+
+impl Default for SotaRoutingConfig {
+    fn default() -> Self {
+        Self {
+            base: IsochroneConfig::default(),
+            envelope_step_minutes: 30.0,
+            arrival_radius_m: 5000.0,
+            optimize_cost: true,
+        }
+    }
+}
+
+/// Arrival envelope band: points reachable at destination within a time window
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrivalEnvelope {
+    pub min_eta_hours: f64,
+    pub max_eta_hours: f64,
+    /// Upwind / departure-side boundary points forming the envelope
+    pub boundary_points: Vec<Point>,
+}
+
+/// Result of SOTA isochrone computation
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SotaRoutingResult {
+    pub isochrones: Vec<Isochrone>,
+    pub arrival_envelopes: Vec<ArrivalEnvelope>,
+    pub best_route: Option<Vec<Point>>,
+    pub best_eta_hours: Option<f64>,
+    pub best_cost: Option<f64>,
+}
+
 /// Configuration pour le calcul d'isochrone
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsochroneConfig {
     pub start: Point,
     pub destination: Option<Point>, // Optionnel pour isochrone simple

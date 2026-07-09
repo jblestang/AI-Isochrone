@@ -1,0 +1,8 @@
+[build]
+target = "wasm32-unknown-unknown"
+dist = "dist"
+public_url = "/"
+filehash = false
+
+[watch]
+ignore = ["dist"]

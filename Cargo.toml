@@ -1,12 +1,16 @@
 [package]
 name = "ai-isochrone"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roaring-landmask = "0.10"
+roaring-landmask = { version = "0.10", optional = true }
 rayon = "1.8"
 ndarray = "0.15"
 itertools = "0.12"
@@ -16,29 +20,41 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 geo-types = "0.7"
 geo = "0.27"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["wasmbind"] }
 anyhow = "1.0"
 thiserror = "1.0"
 clap = { version = "4.4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Window", "Document", "HtmlCanvasElement"] }
+console_error_panic_hook = { version = "0.1", optional = true }
+getrandom = { version = "0.2", features = ["js"], optional = true }
 
-# GUI pour visualisation (features optionnelles)
-# Note: walkers 0.51 utilise egui 0.33, donc on aligne toutes les versions
-eframe = { version = "0.33", default-features = false, features = ["glow"], optional = true }
+# GUI (native + wasm)
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"], optional = true }
 egui = { version = "0.33", optional = true }
 egui_extras = { version = "0.33", features = ["image", "all_loaders"], optional = true }
 image = { version = "0.24", optional = true }
-poll-promise = { version = "0.3", optional = true }
+poll-promise = { version = "0.3", optional = true, features = ["web"] }
 walkers = { version = "0.51", optional = true }
 
 [features]
-default = []
+default = ["native-landmask"]
+native-landmask = ["roaring-landmask"]
 gui = ["eframe", "egui", "egui_extras", "image", "poll-promise", "walkers"]
+web = ["gui", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "console_error_panic_hook", "getrandom"]
 
 [[bin]]
 name = "ai-isochrone-gui"
 path = "src/gui_main.rs"
-required-features = ["gui"]
+required-features = ["gui", "native-landmask"]
 
 [dev-dependencies]
 criterion = "0.5"
+
+[profile.release]
+opt-level = 2
+
+[profile.release.package."*"]
+opt-level = 2
