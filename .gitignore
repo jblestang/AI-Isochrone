@@ -20,3 +20,4 @@ Thumbs.db
 *.kml
 /dist/
 /web/dist/
+*.png
