@@ -392,6 +392,11 @@ impl IsochroneCalculator {
     }
 }
 
+/// Simplifie une isochrone (public API for SOTA router)
+pub fn simplify_isochrone_public(isochrone: &mut Isochrone) {
+    simplify_isochrone(isochrone);
+}
+
 /// Simplifie une isochrone en éliminant les points trop proches par discrétisation lat/lon
 /// Utilise une grille spatiale pour garder un seul point par cellule
 fn simplify_isochrone(isochrone: &mut Isochrone) {
