@@ -174,9 +174,6 @@ fn render_snapshot(
         img.put_pixel(x, y, land);
     }
 
-    // Wind field (speed + direction arrows on sea)
-    draw_wind_field(&mut img, &vp, landmask, grib, start_time);
-
     // Isochrone rings (12 h steps)
     if !result.isochrones.is_empty() {
         let iso_colors = [
@@ -204,6 +201,9 @@ fn render_snapshot(
             }
         }
     }
+
+    // Wind arrows on top of isochrones (bright cyan, thick strokes)
+    draw_wind_field(&mut img, &vp, landmask, grib, start_time);
 
     // Optimal route
     if let Some(route) = &result.best_route {
@@ -234,8 +234,7 @@ fn draw_wind_field(
     grib: &SeededWindGribProvider,
     start_time: DateTime<Utc>,
 ) {
-    let step = 56u32;
-    let arrow_color = Rgba([140, 210, 255, 210]);
+    let step = 44u32;
     let mut y = TITLE_BAR_H + step / 2;
     while y < HEIGHT {
         let mut x = step / 2;
@@ -248,7 +247,7 @@ fn draw_wind_field(
             let wind = grib
                 .get_wind(&point, start_time)
                 .unwrap_or(Wind::new(270.0, 10.0));
-            draw_wind_arrow(img, x as i32, y as i32, &wind, arrow_color);
+            draw_wind_arrow(img, x as i32, y as i32, &wind);
             x += step;
         }
         y += step;
@@ -256,19 +255,36 @@ fn draw_wind_field(
 }
 
 /// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
-fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
+fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind) {
     let to_deg = (wind.direction + 180.0).rem_euclid(360.0);
-    let len = (wind.speed * 2.2).clamp(10.0, 30.0) as i32;
+    let len = (wind.speed * 3.0).clamp(18.0, 42.0) as i32;
     let rad = to_deg.to_radians();
     let ex = cx + (rad.sin() * len as f64).round() as i32;
     let ey = cy - (rad.cos() * len as f64).round() as i32;
-    draw_line(img, (cx, cy), (ex, ey), color);
-    for sign in [-1.0_f64, 1.0] {
-        let hr = (to_deg + 180.0 + sign * 22.0).to_radians();
-        let hx = ex + (hr.sin() * 5.0).round() as i32;
-        let hy = ey - (hr.cos() * 5.0).round() as i32;
-        draw_line(img, (ex, ey), (hx, hy), color);
+
+    let outline = Rgba([8, 25, 55, 255]);
+    let shaft = Rgba([80, 210, 255, 255]);
+    let head = Rgba([160, 245, 255, 255]);
+
+    // Dark outline for contrast on blue sea
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)] {
+        draw_thick_line(
+            img,
+            (cx + dx, cy + dy),
+            (ex + dx, ey + dy),
+            outline,
+            2,
+        );
     }
+    draw_thick_line(img, (cx, cy), (ex, ey), shaft, 2);
+
+    for sign in [-1.0_f64, 1.0] {
+        let hr = (to_deg + 180.0 + sign * 24.0).to_radians();
+        let hx = ex + (hr.sin() * 9.0).round() as i32;
+        let hy = ey - (hr.cos() * 9.0).round() as i32;
+        draw_thick_line(img, (ex, ey), (hx, hy), head, 2);
+    }
+    put_pixel_opaque(img, cx, cy, shaft);
 }
 
 fn draw_label_bar(
@@ -433,6 +449,16 @@ fn draw_marker(img: &mut RgbaImage, (cx, cy): (i32, i32), color: Rgba<u8>, r: i3
 }
 
 fn draw_line(img: &mut RgbaImage, (x0, y0): (i32, i32), (x1, y1): (i32, i32), color: Rgba<u8>) {
+    draw_thick_line(img, (x0, y0), (x1, y1), color, 1);
+}
+
+fn draw_thick_line(
+    img: &mut RgbaImage,
+    (x0, y0): (i32, i32),
+    (x1, y1): (i32, i32),
+    color: Rgba<u8>,
+    half_width: i32,
+) {
     let mut x = x0;
     let mut y = y0;
     let dx = (x1 - x0).abs();
@@ -442,14 +468,12 @@ fn draw_line(img: &mut RgbaImage, (x0, y0): (i32, i32), (x1, y1): (i32, i32), co
     let mut err = dx + dy;
 
     loop {
-        if x >= 0 && y >= 0 && (x as u32) < WIDTH && (y as u32) < HEIGHT {
-            for t in -1..=1 {
-                for s in -1..=1 {
-                    let px = x + s;
-                    let py = y + t;
-                    if px >= 0 && py >= 0 && (px as u32) < WIDTH && (py as u32) < HEIGHT {
-                        img.put_pixel(px as u32, py as u32, color);
-                    }
+        for t in -half_width..=half_width {
+            for s in -half_width..=half_width {
+                let px = x + s;
+                let py = y + t;
+                if px >= 0 && py >= 0 && (px as u32) < WIDTH && (py as u32) < HEIGHT {
+                    put_pixel_opaque(img, px, py, color);
                 }
             }
         }
@@ -465,6 +489,12 @@ fn draw_line(img: &mut RgbaImage, (x0, y0): (i32, i32), (x1, y1): (i32, i32), co
             err += dx;
             y += sy;
         }
+    }
+}
+
+fn put_pixel_opaque(img: &mut RgbaImage, x: i32, y: i32, color: Rgba<u8>) {
+    if x >= 0 && y >= 0 && (x as u32) < WIDTH && (y as u32) < HEIGHT {
+        img.put_pixel(x as u32, y as u32, color);
     }
 }
 
