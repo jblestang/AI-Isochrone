@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Utc::now();
     let seed = weather_seed();
     let grib = simulation_grib(seed).with_epoch(start_time);
+    let step_hours = config.base.simulation_step_seconds() / 3600.0;
     let result = calculate_sota_routing(
         config,
         ObjectiveWeights::default(),
@@ -66,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed,
         start,
         dest,
+        step_hours,
         &out_path,
     )?;
 
@@ -140,6 +142,7 @@ fn render_snapshot(
     seed: u64,
     start: Point,
     dest: Point,
+    step_hours: f64,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut points = vec![start, dest];
@@ -202,8 +205,17 @@ fn render_snapshot(
         }
     }
 
-    // Wind arrows on top of isochrones (bright cyan, thick strokes)
-    draw_wind_field(&mut img, &vp, landmask, grib, start_time);
+    // Wind at simulation time when the wavefront reached each location
+    draw_wind_field(
+        &mut img,
+        &vp,
+        landmask,
+        grib,
+        start_time,
+        &result.isochrones,
+        result.best_route.as_deref(),
+        step_hours,
+    );
 
     // Optimal route
     if let Some(route) = &result.best_route {
@@ -233,6 +245,9 @@ fn draw_wind_field(
     landmask: &Landmask,
     grib: &SeededWindGribProvider,
     start_time: DateTime<Utc>,
+    isochrones: &[Isochrone],
+    route: Option<&[Point]>,
+    step_hours: f64,
 ) {
     let step = 44u32;
     let mut y = TITLE_BAR_H + step / 2;
@@ -244,14 +259,107 @@ fn draw_wind_field(
                 x += step;
                 continue;
             }
+            let Some(sim_hours) = simulation_hours_at(&point, isochrones, route, step_hours) else {
+                x += step;
+                continue;
+            };
+            let sample_time =
+                start_time + chrono::Duration::seconds((sim_hours * 3600.0).round() as i64);
             let wind = grib
-                .get_wind(&point, start_time)
+                .get_wind(&point, sample_time)
                 .unwrap_or(Wind::new(270.0, 10.0));
             draw_wind_arrow(img, x as i32, y as i32, &wind);
             x += step;
         }
         y += step;
     }
+}
+
+/// Simulation time (hours) when routing first reached `point` (from isochrones / route).
+fn simulation_hours_at(
+    point: &Point,
+    isochrones: &[Isochrone],
+    route: Option<&[Point]>,
+    step_hours: f64,
+) -> Option<f64> {
+    const NEAR_ISO_M: f64 = 50_000.0;
+    const NEAR_ROUTE_M: f64 = 35_000.0;
+
+    let mut from_iso = None;
+    let mut sorted: Vec<&Isochrone> = isochrones.iter().filter(|i| !i.points.is_empty()).collect();
+    sorted.sort_by(|a, b| {
+        a.time_hours
+            .partial_cmp(&b.time_hours)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for iso in sorted {
+        if iso
+            .points
+            .iter()
+            .any(|p| point.distance_to(p) <= NEAR_ISO_M)
+        {
+            from_iso = Some(iso.time_hours);
+            break;
+        }
+    }
+
+    let from_route = route.and_then(|r| time_hours_near_route(point, r, step_hours, NEAR_ROUTE_M));
+
+    match (from_iso, from_route) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn time_hours_near_route(
+    point: &Point,
+    route: &[Point],
+    step_hours: f64,
+    radius_m: f64,
+) -> Option<f64> {
+    if route.len() < 2 {
+        return None;
+    }
+    let mut best_time = None;
+    let mut best_dist = f64::INFINITY;
+    let mut cum_hours = 0.0;
+    for seg in route.windows(2) {
+        let (d, frac) = point_to_segment(point, &seg[0], &seg[1]);
+        if d <= radius_m && d < best_dist {
+            best_dist = d;
+            best_time = Some(cum_hours + frac * step_hours);
+        }
+        cum_hours += step_hours;
+    }
+    best_time
+}
+
+fn point_to_segment(p: &Point, a: &Point, b: &Point) -> (f64, f64) {
+    let ax = a.lon.to_radians();
+    let ay = a.lat.to_radians();
+    let bx = b.lon.to_radians();
+    let by = b.lat.to_radians();
+    let px = p.lon.to_radians();
+    let py = p.lat.to_radians();
+
+    let abx = bx - ax;
+    let aby = by - ay;
+    let apx = px - ax;
+    let apy = py - ay;
+    let ab2 = abx * abx + aby * aby;
+    let frac = if ab2 < 1e-18 {
+        0.0
+    } else {
+        (apx * abx + apy * aby).clamp(0.0, 1.0) / ab2
+    };
+    let proj_x = ax + frac * abx;
+    let proj_y = ay + frac * aby;
+    let dlat = py - proj_y;
+    let dlon = px - proj_x;
+    let dist_m = ((dlat * dlat + dlon * dlon).sqrt()) * 6371000.0;
+    (dist_m, frac)
 }
 
 /// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
@@ -309,17 +417,19 @@ fn draw_label_bar(
     );
 
     let w0 = grib.get_wind(&start, start_time).unwrap();
-    let w_mid = grib
-        .get_wind(
-            &start,
-            start_time + chrono::Duration::hours((result.best_eta_hours.unwrap_or(96.0) / 2.0) as i64),
-        )
-        .unwrap();
+    let mid_hours = result.best_eta_hours.unwrap_or(96.0) / 2.0;
+    let mid_time = start_time + chrono::Duration::seconds((mid_hours * 3600.0) as i64);
+    let mid_pt = result
+        .best_route
+        .as_ref()
+        .and_then(|r| r.get(r.len() / 2))
+        .copied()
+        .unwrap_or(start);
+    let w_mid = grib.get_wind(&mid_pt, mid_time).unwrap();
     let wind_line = format!(
-        "Wind t0: {:.0}deg {:.1}kt | t+{:.0}h: {:.0}deg {:.1}kt | seed {}",
+        "Wind @ sim time | t0: {:.0}deg {:.1}kt | route mid: {:.0}deg {:.1}kt | seed {}",
         w0.direction,
         w0.speed * 1.944,
-        result.best_eta_hours.unwrap_or(96.0) / 2.0,
         w_mid.direction,
         w_mid.speed * 1.944,
         seed
@@ -332,7 +442,7 @@ fn draw_label_bar(
         img,
         WIDTH as i32 - 220,
         42,
-        "arrows = wind",
+        "arrows = TWS @ sim time",
         Rgba([150, 220, 255, 255]),
     );
 }
