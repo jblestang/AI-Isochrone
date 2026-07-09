@@ -3,8 +3,8 @@ use crate::envelope::{build_arrival_envelopes, simplify_envelope_boundary};
 use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use crate::grib::GribProvider;
 use crate::landmask::Landmask;
-use crate::objective::{step_cost, CostComponents, ObjectiveWeights};
-use crate::polar::{angle_au_vent, routing_headings, Polar, MIN_ANGLE_AU_VENT_DEG};
+use crate::objective::{sail_change_penalty_seconds, step_cost, CostComponents, ObjectiveWeights};
+use crate::polar::{angle_au_vent, routing_headings, Polar, MIN_ANGLE_AU_VENT_DEG, MIN_SAIL_CHANGE_INTERVAL_SECONDS};
 use crate::route::build_route_legs;
 use crate::sea_state::{DefaultSeaStateModifier, SeaStatePolarModifier};
 use crate::types::*;
@@ -115,6 +115,8 @@ struct SuccCandidate {
     dist_from_start: f64,
     wind: Wind,
     sea_state: SeaState,
+    active_sail: Option<usize>,
+    last_sail_change_time: f64,
 }
 
 struct LayerExpansion {
@@ -149,6 +151,8 @@ struct CellRecord {
     parent: Option<NodeKey>,
     wind: Wind,
     sea_state: SeaState,
+    active_sail: Option<usize>,
+    last_sail_change_time: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +166,8 @@ struct SotaNode {
     cell_key: NodeKey,
     /// Accumulated hop distance from start (for fast grid precision without haversine).
     dist_from_start: f64,
+    active_sail: Option<usize>,
+    last_sail_change_time: f64,
 }
 
 impl PartialEq for SotaNode {
@@ -274,6 +280,8 @@ impl SotaIsochroneRouter {
             parent_key: None,
             cell_key: start_key,
             dist_from_start: 0.0,
+            active_sail: None,
+            last_sail_change_time: 0.0,
         };
         let start_env = self.resolve_env(base.start, 0.0);
         let mut layer = vec![start_node];
@@ -286,6 +294,8 @@ impl SotaIsochroneRouter {
                 parent: None,
                 wind: start_env.wind,
                 sea_state: start_env.sea_state,
+                active_sail: None,
+                last_sail_change_time: 0.0,
             },
         );
         if let Some(t) = tracker.as_mut() {
@@ -299,8 +309,12 @@ impl SotaIsochroneRouter {
         let dest = base.destination;
         let mut best_arrival_time = f64::INFINITY;
 
-        let max_nodes =
-            ((base.time_limit_hours * 120_000.0) as usize).clamp(500_000, 25_000_000);
+        let direct_nm = dest
+            .map(|d| base.start.distance_to(&d) / 1852.0)
+            .unwrap_or(500.0);
+        let distance_factor = (direct_nm / 1000.0).clamp(0.5, 5.0);
+        let max_nodes = ((base.time_limit_hours * 120_000.0 * distance_factor) as usize)
+            .clamp(500_000, 100_000_000);
         let mut nodes_explored = 0usize;
         let iso_band = base.isochrone_step_hours * 3600.0;
         let mut current_time = 0.0;
@@ -404,6 +418,8 @@ impl SotaIsochroneRouter {
                             parent: Some(exp.key),
                             wind: succ.wind,
                             sea_state: succ.sea_state,
+                            active_sail: succ.active_sail,
+                            last_sail_change_time: succ.last_sail_change_time,
                         });
                         if let Some(t) = tracker.as_mut() {
                             t.try_update_sea(succ.point, succ.time);
@@ -416,6 +432,8 @@ impl SotaIsochroneRouter {
                             parent_key: Some(exp.key),
                             cell_key: succ.cell_key,
                             dist_from_start: succ.dist_from_start,
+                            active_sail: succ.active_sail,
+                            last_sail_change_time: succ.last_sail_change_time,
                         });
                     }
                 }
@@ -702,7 +720,44 @@ impl SotaIsochroneRouter {
         if angle + 1e-6 < MIN_ANGLE_AU_VENT_DEG {
             return None;
         }
-        let boat_speed = self.polar.speed_ms(angle, env.wind.speed)
+        let Some((mut new_sail_idx, mut speed_kt)) =
+            self.polar.select_sail_plan(node.active_sail, angle, env.wind.speed)
+        else {
+            return None;
+        };
+
+        let mut sail_penalty = sail_change_penalty_seconds(
+            node.active_sail,
+            Some(new_sail_idx),
+            self.weights.sail_change_penalty_seconds,
+        );
+
+        if let Some(prev) = node.active_sail {
+            if prev != new_sail_idx && sail_penalty > 0.0 {
+                if let Some(spd) = self.polar.speed_for_sail(prev, angle, env.wind.speed) {
+                    let within_cooldown =
+                        new_time - node.last_sail_change_time < MIN_SAIL_CHANGE_INTERVAL_SECONDS;
+                    let sticky_plan = self.polar.select_sail_plan(
+                        Some(prev),
+                        angle,
+                        env.wind.speed,
+                    );
+                    let sticky_keeps_prev =
+                        sticky_plan.map(|(idx, _)| idx == prev).unwrap_or(false);
+                    if sticky_keeps_prev {
+                        new_sail_idx = prev;
+                        speed_kt = spd;
+                        sail_penalty = 0.0;
+                    } else if within_cooldown {
+                        new_sail_idx = prev;
+                        speed_kt = spd;
+                        sail_penalty = 0.0;
+                    }
+                }
+            }
+        }
+
+        let boat_speed = speed_kt / 1.944
             * self.sea_modifier.speed_factor(angle, &env.sea_state);
         if boat_speed < 0.05 {
             return None;
@@ -728,8 +783,18 @@ impl SotaIsochroneRouter {
         let dist_from_start = node.dist_from_start + distance;
         let cell_key = point_key_from_dist(&new_point, dist_from_start);
 
-        let cost = if track_cost {
-            let step = step_cost(
+        let new_sail = Some(new_sail_idx);
+        let final_time = new_time + sail_penalty;
+        let last_sail_change_time = if sail_penalty > 0.0 {
+            final_time
+        } else if node.active_sail.is_none() {
+            final_time
+        } else {
+            node.last_sail_change_time
+        };
+
+        let mut cost = if track_cost {
+            let mut step = step_cost(
                 step_seconds,
                 Some(node.heading),
                 heading,
@@ -738,23 +803,33 @@ impl SotaIsochroneRouter {
                 &env.sea_state,
                 &self.weights,
             );
+            step.sail_change_penalty = sail_penalty;
+            if sail_penalty > 0.0 {
+                step.eta_seconds += sail_penalty;
+            }
             node.cost.add(&step)
         } else {
             CostComponents {
-                eta_seconds: new_time,
+                eta_seconds: final_time,
+                sail_change_penalty: sail_penalty,
                 ..Default::default()
             }
         };
+        if !track_cost && sail_penalty > 0.0 {
+            cost.sail_change_penalty = sail_penalty;
+        }
 
         Some(SuccCandidate {
             point: new_point,
-            time: new_time,
+            time: final_time,
             heading,
             cost,
             cell_key,
             dist_from_start,
             wind: env.wind,
             sea_state: env.sea_state,
+            active_sail: new_sail,
+            last_sail_change_time,
         })
     }
 
@@ -801,8 +876,16 @@ impl SotaIsochroneRouter {
             .iter()
             .map(|c| (c.wind, c.sea_state))
             .collect();
+        let sail_samples: Vec<Option<usize>> =
+            raw_chain.iter().map(|c| c.active_sail).collect();
 
-        let legs = build_route_legs(&route, &headings, step_hours, &wind_samples);
+        let legs = build_route_legs(
+            &route,
+            &headings,
+            step_hours,
+            &wind_samples,
+            Some(&sail_samples),
+        );
 
         let best_route = if route.is_empty() { None } else { Some(route) };
 
@@ -864,8 +947,8 @@ pub fn calculate_sota_routing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::default_routing_polar;
     use crate::grib::SimpleGribProvider;
-    use crate::polar::SimplePolar;
 
     #[test]
     fn sota_routing_produces_isochrones() {
@@ -882,7 +965,7 @@ mod tests {
             config,
             ObjectiveWeights::default(),
             landmask,
-            Box::new(SimplePolar::default_voilier()),
+            default_routing_polar(),
             Box::new(SimpleGribProvider::default()),
             Utc::now(),
         );
@@ -900,7 +983,7 @@ mod tests {
             ..SotaRoutingConfig::default()
         };
         let landmask = Landmask::new().unwrap();
-        let polar = Box::new(SimplePolar::default_voilier());
+        let polar = default_routing_polar();
         let grib = Box::new(SimpleGribProvider::default());
 
         let mut loose = base_config.clone();
@@ -909,7 +992,7 @@ mod tests {
             loose,
             ObjectiveWeights::default(),
             landmask.clone(),
-            polar.clone(),
+            default_routing_polar(),
             grib.clone(),
             Utc::now(),
         );

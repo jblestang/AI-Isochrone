@@ -24,9 +24,13 @@ impl Landmask {
     }
 
     pub fn is_land(&self, point: &Point) -> bool {
+        if !point.lat.is_finite() || !point.lon.is_finite() {
+            return true;
+        }
+        let lat = point.lat.clamp(-89.999, 89.999);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.mask.contains(point.lon, point.lat)
+            self.mask.contains(point.lon, lat)
         }
         #[cfg(target_arch = "wasm32")]
         {

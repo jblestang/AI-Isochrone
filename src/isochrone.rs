@@ -535,7 +535,7 @@ mod tests {
     fn test_isochrone_calculator() {
         let config = IsochroneConfig::default();
         let landmask = Landmask::new().unwrap();
-        let polar = Box::new(SimplePolar::default_voilier());
+        let polar = default_routing_polar();
         let grib = Box::new(SimpleGribProvider::default());
         let start_time = Utc::now();
         

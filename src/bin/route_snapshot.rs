@@ -1,5 +1,6 @@
 use ai_isochrone::*;
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -12,6 +13,23 @@ const DEFAULT_WEATHER_SEED: u64 = 42;
 const TITLE_BAR_H: u32 = 64;
 const ROUTE_WIND_STEP_HOURS: f64 = 12.0;
 
+#[derive(Parser, Debug)]
+#[command(name = "route-snapshot", about = "Render a routed passage map PNG")]
+struct Args {
+    #[arg(long, env = "AI_ISOCHRONE_FROM_LAT", default_value_t = DEFAULT_FROM_LAT)]
+    from_lat: f64,
+    #[arg(long, env = "AI_ISOCHRONE_FROM_LON", default_value_t = DEFAULT_FROM_LON)]
+    from_lon: f64,
+    #[arg(long, env = "AI_ISOCHRONE_TO_LAT", default_value_t = DEFAULT_TO_LAT)]
+    to_lat: f64,
+    #[arg(long, env = "AI_ISOCHRONE_TO_LON", default_value_t = DEFAULT_TO_LON)]
+    to_lon: f64,
+    #[arg(long, env = "AI_ISOCHRONE_TIME_LIMIT_HOURS", default_value_t = DEFAULT_TIME_LIMIT_HOURS)]
+    time_limit_hours: f64,
+    #[arg(long, env = "AI_ISOCHRONE_SNAPSHOT")]
+    output: Option<PathBuf>,
+}
+
 fn weather_seed() -> u64 {
     std::env::var("AI_ISOCHRONE_WEATHER_SEED")
         .ok()
@@ -20,14 +38,16 @@ fn weather_seed() -> u64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start = Point::new(47.55, -3.48);
-    let dest = Point::new(62.39, 17.31); // Sundsvall, Sweden
+    let args = Args::parse();
+    let endpoints = RouteEndpoints::from_coords(args.from_lat, args.from_lon, args.to_lat, args.to_lon);
+    let start = endpoints.start;
+    let dest = endpoints.dest;
 
     let config = SotaRoutingConfig {
         base: IsochroneConfig {
             start,
             destination: Some(dest),
-            time_limit_hours: 400.0,
+            time_limit_hours: args.time_limit_hours,
             isochrone_step_hours: ISOCHRONE_STEP_HOURS,
             num_directions: 16,
             ..Default::default()
@@ -40,9 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "Computing Lorient → Sundsvall route ({} h isochrones, weather seed {})...",
+        "Computing route {} ({} h isochrones, weather seed {}, limit {:.0} h)...",
+        endpoints.label(),
         ISOCHRONE_STEP_HOURS,
-        weather_seed()
+        weather_seed(),
+        args.time_limit_hours,
     );
     let t0 = Instant::now();
     let landmask = Landmask::new()?;
@@ -53,13 +75,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         ObjectiveWeights::default(),
         landmask.clone(),
-        Box::new(SimplePolar::default_voilier()),
+        default_routing_polar(),
         Box::new(grib.clone()),
         start_time,
     );
     let compute_time = t0.elapsed();
 
-    let out_path = snapshot_path();
+    let out_path = args
+        .output
+        .unwrap_or_else(|| snapshot_path(&endpoints));
     render_snapshot(
         &result,
         &landmask,
@@ -68,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed,
         start,
         dest,
+        &endpoints.label(),
         &out_path,
     )?;
 
@@ -82,12 +107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn snapshot_path() -> PathBuf {
+fn snapshot_path(endpoints: &RouteEndpoints) -> PathBuf {
+    let name = format!("{}.png", endpoints.snapshot_slug());
     let artifacts = PathBuf::from("/opt/cursor/artifacts");
     if artifacts.exists() {
-        artifacts.join("lorient-sundsvall-route.png")
+        artifacts.join(name)
     } else {
-        PathBuf::from("lorient-sundsvall-route.png")
+        PathBuf::from(name)
     }
 }
 
@@ -142,6 +168,7 @@ fn render_snapshot(
     seed: u64,
     start: Point,
     dest: Point,
+    route_label: &str,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut points = vec![start, dest];
@@ -204,18 +231,20 @@ fn render_snapshot(
         }
     }
 
-    // Optimal route
-    if let Some(route) = &result.best_route {
-        let route_color = Rgba([255, 40, 40, 255]);
+    // Optimal route — color by active sail configuration
+    if !result.route_legs.is_empty() {
+        draw_route_by_sail(&mut img, &vp, &result.route_legs);
+    } else if let Some(route) = &result.best_route {
+        let fallback = Rgba([200, 200, 200, 255]);
         for w in route.windows(2) {
-            let a = vp.project(&w[0]);
-            let b = vp.project(&w[1]);
-            draw_line(&mut img, a, b, route_color);
+            draw_line(&mut img, vp.project(&w[0]), vp.project(&w[1]), fallback);
         }
+    }
 
+    if let Some(route) = &result.best_route {
         // True wind along route at simulation time for each 12 h leg
         let eta = result.best_eta_hours.unwrap_or(200.0);
-        let polar = SimplePolar::default_voilier();
+        let polar = MultiSailPolar::default_voilier();
         draw_route_wind(
             &mut img,
             &vp,
@@ -227,6 +256,7 @@ fn render_snapshot(
             start_time,
             eta,
         );
+        draw_sail_legend_bar(&mut img, &polar);
     }
 
     // Start / destination markers
@@ -235,10 +265,41 @@ fn render_snapshot(
 
     // Title bar + legend
     fill_rect(&mut img, 0, 0, WIDTH, TITLE_BAR_H, Rgba([15, 25, 40, 230]));
-    draw_label_bar(&mut img, result, grib, start_time, seed, start);
+    draw_label_bar(&mut img, result, grib, start_time, seed, start, route_label);
 
     img.save(path)?;
     Ok(())
+}
+
+fn sail_rgba(index: Option<usize>) -> Rgba<u8> {
+    let [r, g, b] = MultiSailPolar::sail_color_rgb(index);
+    Rgba([r, g, b, 255])
+}
+
+fn draw_route_by_sail(img: &mut RgbaImage, vp: &Viewport, legs: &[RouteLeg]) {
+    for leg in legs {
+        let color = sail_rgba(leg.active_sail_index);
+        draw_thick_line(
+            img,
+            vp.project(&leg.from),
+            vp.project(&leg.to),
+            color,
+            3,
+        );
+    }
+}
+
+fn draw_sail_legend_bar(img: &mut RgbaImage, polar: &MultiSailPolar) {
+    let mut x = WIDTH as i32 - 220;
+    let mut y = HEIGHT as i32 - 88;
+    draw_text(img, x, y, "Route by sail", Rgba([200, 210, 230, 255]));
+    y += 16;
+    for (i, sail) in polar.sails().iter().enumerate() {
+        let c = sail_rgba(Some(i));
+        fill_rect(img, (x - 4) as u32, y as u32, 18, 4, c);
+        draw_text(img, x + 20, y - 4, sail.name, c);
+        y += 14;
+    }
 }
 
 fn draw_route_wind(
@@ -247,21 +308,21 @@ fn draw_route_wind(
     route: &[Point],
     headings: &[f64],
     legs: &[RouteLeg],
-    polar: &SimplePolar,
+    polar: &dyn Polar,
     grib: &SeededWindGribProvider,
     start_time: DateTime<Utc>,
     eta_hours: f64,
 ) {
-    let samples: Vec<(Point, f64, f64, Option<Wind>, f64)> = if legs.is_empty() {
+    let samples: Vec<(Point, f64, f64, Option<Wind>, f64, Option<usize>)> = if legs.is_empty() {
         samples_along_route_with_heading(route, headings, eta_hours, ROUTE_WIND_STEP_HOURS)
             .into_iter()
-            .map(|(pt, hdg, h)| (pt, hdg, h, None, hdg))
+            .map(|(pt, hdg, h)| (pt, hdg, h, None, hdg, None))
             .collect()
     } else {
         samples_from_route_legs(legs, eta_hours, ROUTE_WIND_STEP_HOURS)
     };
 
-    for (point, heading, sim_hours, leg_wind, track_bearing) in samples {
+    for (point, heading, sim_hours, leg_wind, track_bearing, sail_idx) in samples {
         let wind = if let Some(w) = leg_wind {
             w
         } else {
@@ -282,7 +343,7 @@ fn draw_route_wind(
         x += 14;
         y -= 10;
         draw_wind_from_arrow(img, x, y, &wind, color);
-        draw_boat_heading_arrow(img, x, y, heading, Rgba([255, 255, 255, 220]));
+        draw_boat_heading_arrow(img, x, y, heading, sail_rgba(sail_idx));
         let label = if (twa - cog_twa).abs() > 8.0 {
             format!(
                 "{:.0}h TWA {:.0}° COG {:.0}° {:.0}kt",
@@ -305,22 +366,25 @@ fn samples_from_route_legs(
     legs: &[RouteLeg],
     eta_hours: f64,
     step_hours: f64,
-) -> Vec<(Point, f64, f64, Option<Wind>, f64)> {
+) -> Vec<(Point, f64, f64, Option<Wind>, f64, Option<usize>)> {
     if legs.is_empty() || eta_hours <= 0.0 {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut h = 0.0;
     while h <= eta_hours + 1e-3 {
-        if let Some((pt, heading, wind, track)) = point_on_legs_at_hour(legs, eta_hours, h) {
-            out.push((pt, heading, h, Some(wind), track));
+        if let Some((pt, heading, wind, track, sail)) =
+            point_on_legs_at_hour(legs, eta_hours, h)
+        {
+            out.push((pt, heading, h, Some(wind), track, sail));
         }
         h += step_hours;
     }
-    if out.last().map(|(_, _, th, _, _)| (*th - eta_hours).abs()) > Some(1.0) {
-        if let Some((pt, heading, wind, track)) = point_on_legs_at_hour(legs, eta_hours, eta_hours)
+    if out.last().map(|(_, _, th, _, _, _)| (*th - eta_hours).abs()) > Some(1.0) {
+        if let Some((pt, heading, wind, track, sail)) =
+            point_on_legs_at_hour(legs, eta_hours, eta_hours)
         {
-            out.push((pt, heading, eta_hours, Some(wind), track));
+            out.push((pt, heading, eta_hours, Some(wind), track, sail));
         }
     }
     out
@@ -330,7 +394,7 @@ fn point_on_legs_at_hour(
     legs: &[RouteLeg],
     eta_hours: f64,
     hour: f64,
-) -> Option<(Point, f64, Wind, f64)> {
+) -> Option<(Point, f64, Wind, f64, Option<usize>)> {
     let target = (hour / eta_hours).clamp(0.0, 1.0) * eta_hours;
     let mut cum = 0.0;
     for leg in legs {
@@ -342,13 +406,25 @@ fn point_on_legs_at_hour(
                 0.0
             };
             let pt = interpolate_point(&leg.from, &leg.to, frac);
-            return Some((pt, leg.boat_heading_deg, leg.wind, leg.bearing_deg));
+            return Some((
+                pt,
+                leg.boat_heading_deg,
+                leg.wind,
+                leg.bearing_deg,
+                leg.active_sail_index,
+            ));
         }
         cum = end;
     }
-    legs
-        .last()
-        .map(|leg| (leg.to, leg.boat_heading_deg, leg.wind, leg.bearing_deg))
+    legs.last().map(|leg| {
+        (
+            leg.to,
+            leg.boat_heading_deg,
+            leg.wind,
+            leg.bearing_deg,
+            leg.active_sail_index,
+        )
+    })
 }
 
 fn samples_along_route_with_heading(
@@ -525,6 +601,7 @@ fn draw_label_bar(
     start_time: DateTime<Utc>,
     seed: u64,
     start: Point,
+    route_label: &str,
 ) {
     let eta = result
         .best_eta_hours
@@ -532,7 +609,8 @@ fn draw_label_bar(
         .unwrap_or_else(|| "No arrival".into());
     let sailed: f64 = result.route_legs.iter().map(|l| l.distance_nm).sum();
     let subtitle = format!(
-        "Lorient > Sundsvall | {} | {:.0} nm | {:.0}h isochrones | wind every {:.0}h on route",
+        "{} | {} | {:.0} nm | {:.0}h isochrones | wind every {:.0}h on route",
+        route_label,
         eta,
         sailed,
         ISOCHRONE_STEP_HOURS,

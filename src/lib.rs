@@ -1,3 +1,4 @@
+pub mod route_config;
 pub mod types;
 pub mod geometry;
 pub mod landmask;
@@ -34,6 +35,7 @@ pub use sota_isochrone::*;
 pub use grid::*;
 pub use constraints::*;
 pub use route::*;
+pub use route_config::*;
 pub use scenario::*;
 pub use ensemble::*;
 pub use opponent::*;

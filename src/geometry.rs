@@ -31,8 +31,8 @@ pub fn move_from_point_fast(start: &Point, bearing_degrees: f64, distance_meters
     let m_per_deg_lon = M_PER_DEG_LAT * lat_rad.cos();
     let bearing = bearing_degrees.to_radians();
     Point::new(
-        start.lat + (distance_meters * bearing.cos()) / M_PER_DEG_LAT,
-        start.lon + (distance_meters * bearing.sin()) / m_per_deg_lon,
+        (start.lat + (distance_meters * bearing.cos()) / M_PER_DEG_LAT).clamp(-89.999, 89.999),
+        start.lon + (distance_meters * bearing.sin()) / m_per_deg_lon.max(1.0),
     )
 }
 

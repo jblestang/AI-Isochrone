@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn envelope_bands_are_non_overlapping() {
-        let dest = Point::new(62.39, 17.31);
+        let dest = Point::new(crate::route_config::DEFAULT_TO_LAT, crate::route_config::DEFAULT_TO_LON);
         let isochrones = vec![
             Isochrone {
                 time_hours: 10.0,

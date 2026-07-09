@@ -3,6 +3,25 @@ use crate::types::{Point, RouteLeg, Wind, SeaState};
 
 const METERS_PER_NM: f64 = 1852.0;
 
+/// Count hoists/douses: transitions between stable sail configurations along the route.
+pub fn count_distinct_sail_changes(legs: &[RouteLeg]) -> usize {
+    let mut changes = 0usize;
+    let mut last: Option<usize> = None;
+    for leg in legs {
+        let Some(cur) = leg.active_sail_index else {
+            continue;
+        };
+        if last == Some(cur) {
+            continue;
+        }
+        if last.is_some() {
+            changes += 1;
+        }
+        last = Some(cur);
+    }
+    changes
+}
+
 /// Backtrack from arrival cell key through parent map to start.
 pub fn backtrack_route<S1, S2>(
     _start: Point,
@@ -37,6 +56,7 @@ pub fn build_route_legs(
     headings: &[f64],
     step_hours: f64,
     wind_samples: &[(Wind, SeaState)],
+    sail_samples: Option<&[Option<usize>]>,
 ) -> Vec<RouteLeg> {
     if points.len() < 2 {
         return Vec::new();
@@ -56,6 +76,12 @@ pub fn build_route_legs(
             .or_else(|| wind_samples.get(i).copied())
             .unwrap_or((Wind::new(0.0, 0.0), SeaState::default()));
         let is_tack = is_tack_or_gybe(boat_heading, next_leg_heading, wind.direction);
+        let active_sail_index = sail_samples.and_then(|s| s.get(i + 1).copied()).flatten();
+        let prev_sail = sail_samples.and_then(|s| s.get(i).copied()).flatten();
+        let is_sail_change = matches!(
+            (prev_sail, active_sail_index),
+            (Some(p), Some(n)) if p != n
+        );
         legs.push(RouteLeg {
             from,
             to,
@@ -64,6 +90,8 @@ pub fn build_route_legs(
             distance_nm: dist_nm,
             duration_hours: step_hours,
             is_tack,
+            is_sail_change,
+            active_sail_index,
             wind,
             sea_state: sea,
         });
@@ -132,13 +160,13 @@ mod tests {
     #[test]
     fn routed_legs_respect_no_go_zone() {
         use crate::{
-            calculate_sota_routing, polar, simulation_grib, IsochroneConfig, Landmask,
-            ObjectiveWeights, Polar, SimplePolar, SotaRoutingConfig,
+            calculate_sota_routing, default_routing_polar, polar, simulation_grib, IsochroneConfig,
+            Landmask, ObjectiveWeights, Polar, SotaRoutingConfig,
         };
         use chrono::Utc;
 
         let start = Point::new(47.55, -3.48);
-        let dest = Point::new(62.39, 17.31);
+        let dest = Point::new(62.39, 17.31); // Sundsvall — keep CI test fast
         let config = SotaRoutingConfig::route_only(IsochroneConfig {
             start,
             destination: Some(dest),
@@ -149,13 +177,13 @@ mod tests {
             config,
             ObjectiveWeights::default(),
             Landmask::new().unwrap(),
-            Box::new(SimplePolar::default_voilier()),
+            default_routing_polar(),
             Box::new(simulation_grib(42).with_epoch(Utc::now())),
             Utc::now(),
         );
         for (i, leg) in r.route_legs.iter().enumerate().take(30) {
             let twa_boat = polar::angle_au_vent(leg.boat_heading_deg, leg.wind.direction);
-            let spd = SimplePolar::default_voilier().speed_ms(twa_boat, leg.wind.speed);
+            let spd = default_routing_polar().speed_ms(twa_boat, leg.wind.speed);
             assert!(
                 spd >= 0.05 && twa_boat + 1e-6 >= polar::MIN_ANGLE_AU_VENT_DEG,
                 "leg {i} boat TWA {twa_boat} hdg={} wind={} -> {spd} m/s",
@@ -165,5 +193,36 @@ mod tests {
         }
         let tacks = r.route_legs.iter().filter(|l| l.is_tack).count();
         assert!(tacks > 10, "expected tacking on Lorient-Sundsvall, got {tacks} tacks");
+    }
+
+    #[test]
+    fn lorient_copenhagen_sail_changes_are_reasonable() {
+        use crate::{
+            calculate_sota_routing, default_routing_polar, simulation_grib, IsochroneConfig,
+            Landmask, ObjectiveWeights, Point, SotaRoutingConfig,
+        };
+        use chrono::Utc;
+
+        let start = Point::new(47.55, -3.48);
+        let dest = Point::new(55.68, 12.57);
+        let config = SotaRoutingConfig::route_only(IsochroneConfig {
+            start,
+            destination: Some(dest),
+            time_limit_hours: 3500.0,
+            ..Default::default()
+        });
+        let r = calculate_sota_routing(
+            config,
+            ObjectiveWeights::default(),
+            Landmask::new().unwrap(),
+            default_routing_polar(),
+            Box::new(simulation_grib(42).with_epoch(Utc::now())),
+            Utc::now(),
+        );
+        let sail_changes = count_distinct_sail_changes(&r.route_legs);
+        assert!(
+            sail_changes <= 16,
+            "expected a handful of sail hoists on Lorient–Copenhagen, got {sail_changes}"
+        );
     }
 }

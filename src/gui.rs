@@ -4,7 +4,7 @@ mod gui_impl {
         calculate_dual_routing, calculate_sota_routing, default_scenarios, route_to_gpx,
         tack_decision_eta, BufrGribGridProvider, DualRoutingResult, GribProvider, Isochrone,
         Landmask, ObjectiveWeights, OpponentState, Point, Polar, SotaRoutingConfig,
-        SotaRoutingResult, ArrivalEnvelope, SimplePolar, WeatherScenario,
+        SotaRoutingResult, ArrivalEnvelope, WeatherScenario, default_routing_polar,
     };
     use chrono::Utc;
     use eframe::egui;
@@ -256,7 +256,7 @@ mod gui_impl {
                 config,
                 weights,
                 landmask,
-                Box::new(SimplePolar::default_voilier()),
+                default_routing_polar(),
                 grib,
                 Utc::now(),
             ))

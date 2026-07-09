@@ -2,7 +2,7 @@ use crate::ensemble::eta_percentiles_from_results;
 use crate::grib::{BufrGribGridProvider, GribProvider};
 use crate::landmask::Landmask;
 use crate::objective::ObjectiveWeights;
-use crate::polar::{Polar, ScaledPolar, SimplePolar};
+use crate::polar::{default_routing_polar, Polar, ScaledPolar, MultiSailPolar};
 use crate::scenario::ScenarioGribProvider;
 use crate::sota_isochrone::calculate_sota_routing;
 use crate::types::*;
@@ -35,7 +35,7 @@ pub fn calculate_dual_routing(
                 config.clone(),
                 weights.clone(),
                 landmask.clone(),
-                Box::new(SimplePolar::default_voilier()),
+                default_routing_polar(),
                 grib_for_scenario,
                 start_time,
             );
@@ -48,7 +48,7 @@ pub fn calculate_dual_routing(
         config.clone(),
         weights.clone(),
         landmask.clone(),
-        Box::new(SimplePolar::default_voilier()),
+        default_routing_polar(),
         grib,
         start_time,
     );
@@ -57,7 +57,7 @@ pub fn calculate_dual_routing(
     opp_config.base.start = opponent.position;
 
     let opp_polar: Box<dyn Polar + Send + Sync> = Box::new(ScaledPolar::new(
-        SimplePolar::default_voilier(),
+        MultiSailPolar::default_voilier(),
         opponent.polar_scale,
     ));
     let opp_start =
@@ -184,7 +184,7 @@ mod tests {
             config,
             ObjectiveWeights::default(),
             landmask,
-            Box::new(SimplePolar::default_voilier()),
+            default_routing_polar(),
             Box::new(med_grid()),
             Utc::now(),
         );

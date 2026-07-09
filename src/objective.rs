@@ -11,6 +11,8 @@ pub struct ObjectiveWeights {
     pub lambda_comfort: f64,
     pub lambda_manoeuvre: f64,
     pub lambda_safety: f64,
+    /// Added to route time when the active sail changes (seconds).
+    pub sail_change_penalty_seconds: f64,
 }
 
 impl Default for ObjectiveWeights {
@@ -20,6 +22,7 @@ impl Default for ObjectiveWeights {
             lambda_comfort: 0.5,
             lambda_manoeuvre: 1.5,
             lambda_safety: 2.0,
+            sail_change_penalty_seconds: crate::polar::DEFAULT_SAIL_CHANGE_PENALTY_SECONDS,
         }
     }
 }
@@ -31,6 +34,7 @@ pub struct CostComponents {
     pub wave_risk: f64,
     pub comfort: f64,
     pub manoeuvre_penalty: f64,
+    pub sail_change_penalty: f64,
     pub safety_margin: f64,
 }
 
@@ -41,6 +45,7 @@ impl CostComponents {
             + weights.lambda_comfort * self.comfort
             + weights.lambda_manoeuvre * self.manoeuvre_penalty
             + weights.lambda_safety * self.safety_margin
+            + self.sail_change_penalty
     }
 
     pub fn add(&self, other: &CostComponents) -> CostComponents {
@@ -49,8 +54,21 @@ impl CostComponents {
             wave_risk: self.wave_risk + other.wave_risk,
             comfort: self.comfort + other.comfort,
             manoeuvre_penalty: self.manoeuvre_penalty + other.manoeuvre_penalty,
+            sail_change_penalty: self.sail_change_penalty + other.sail_change_penalty,
             safety_margin: self.safety_margin + other.safety_margin,
         }
+    }
+}
+
+/// Penalty in seconds when switching sail plan (hoist/douse).
+pub fn sail_change_penalty_seconds(
+    prev_sail: Option<usize>,
+    new_sail: Option<usize>,
+    penalty_seconds: f64,
+) -> f64 {
+    match (prev_sail, new_sail) {
+        (Some(prev), Some(next)) if prev != next => penalty_seconds,
+        _ => 0.0,
     }
 }
 
@@ -75,6 +93,7 @@ pub fn step_cost(
         wave_risk,
         comfort,
         manoeuvre_penalty: manoeuvre,
+        sail_change_penalty: 0.0,
         safety_margin: safety,
     }
 }
@@ -181,6 +200,16 @@ mod tests {
             &weights,
         );
         assert!(rough.total(&weights) > calm.total(&weights));
+    }
+
+    #[test]
+    fn sail_change_penalty_applies_on_switch() {
+        assert_eq!(
+            sail_change_penalty_seconds(Some(0), Some(2), 1800.0),
+            1800.0
+        );
+        assert_eq!(sail_change_penalty_seconds(None, Some(1), 1800.0), 0.0);
+        assert_eq!(sail_change_penalty_seconds(Some(1), Some(1), 1800.0), 0.0);
     }
 
     #[test]

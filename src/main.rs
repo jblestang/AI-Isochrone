@@ -16,15 +16,15 @@ struct Args {
     start_lon: f64,
 
     /// Latitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 62.39)]
+    #[arg(long, default_value_t = DEFAULT_TO_LAT)]
     dest_lat: f64,
 
     /// Longitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 17.31)]
+    #[arg(long, default_value_t = DEFAULT_TO_LON)]
     dest_lon: f64,
 
     /// Temps limite en heures
-    #[arg(long, default_value_t = 96.0)]
+    #[arg(long, default_value_t = DEFAULT_TIME_LIMIT_HOURS)]
     time_limit_hours: f64,
 
     /// Pas d'isochrone en heures
@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Erreur lors du chargement du landmask: {}", e))?;
 
     println!("   - Configuration de la polaire...");
-    let polar: Box<dyn Polar + Send + Sync> = Box::new(polar::SimplePolar::default_voilier());
+    let polar: Box<dyn Polar + Send + Sync> = default_routing_polar();
 
     println!("   - Configuration du provider GRIB...");
     let start_datetime = Utc::now();

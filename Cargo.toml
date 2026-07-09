@@ -24,7 +24,7 @@ geo = "0.27"
 chrono = { version = "0.4", features = ["wasmbind"] }
 anyhow = "1.0"
 thiserror = "1.0"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 image = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 wasm-bindgen = { version = "0.2", optional = true }
@@ -53,6 +53,10 @@ path = "src/bin/route_eta.rs"
 [[bin]]
 name = "route-snapshot"
 path = "src/bin/route_snapshot.rs"
+
+[[bin]]
+name = "polar-snapshot"
+path = "src/bin/polar_snapshot.rs"
 
 [[bin]]
 name = "ai-isochrone-gui"
