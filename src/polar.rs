@@ -17,6 +17,7 @@ pub trait Polar {
 
 /// Polaire simple basée sur des tables de valeurs
 /// Utilise une interpolation bilinéaire
+#[derive(Clone)]
 pub struct SimplePolar {
     /// Angles au vent en degrés (clés de la table)
     angles: Vec<f64>,
