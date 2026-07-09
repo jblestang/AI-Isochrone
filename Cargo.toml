@@ -46,6 +46,10 @@ gui = ["eframe", "egui", "egui_extras", "image", "poll-promise", "walkers"]
 web = ["gui", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "console_error_panic_hook", "getrandom"]
 
 [[bin]]
+name = "route-eta"
+path = "src/bin/route_eta.rs"
+
+[[bin]]
 name = "ai-isochrone-gui"
 path = "src/gui_main.rs"
 required-features = ["gui", "native-landmask"]

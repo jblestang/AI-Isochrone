@@ -3,9 +3,9 @@ use crate::geometry::*;
 use crate::landmask::Landmask;
 use crate::polar::*;
 use crate::grib::*;
-use crate::grid::{resolve_grid_spec, CellKey, GridBestTracker, RoutingGrid};
+use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use chrono::{DateTime, Utc, Duration};
-use std::collections::{HashMap, BinaryHeap};
+use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
 // Plus besoin de ConvexHull, on utilise notre propre algorithme
@@ -71,7 +71,7 @@ impl IsochroneCalculator {
     /// Calcule les isochrones depuis le point de départ (grid-based, outward envelope).
     pub fn calculate(&self) -> Vec<Isochrone> {
         let time_limit = self.config.time_limit_hours * 3600.0;
-        let _step_seconds = self.config.simulation_step_seconds();
+        let step_seconds = self.config.simulation_step_seconds();
         let iso_band = self.config.isochrone_step_hours * 3600.0;
 
         let grid_spec = resolve_grid_spec(
@@ -82,52 +82,67 @@ impl IsochroneCalculator {
         );
         let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
         let mut tracker = GridBestTracker::new(routing_grid);
-        let grid = tracker.grid().clone();
 
-        let mut visited: HashMap<CellKey, f64> = HashMap::new();
-        let mut frontier = BinaryHeap::new();
+        let mut visited: HashMap<(i32, i32), f64> = HashMap::new();
 
         let start_node = Node {
             point: self.config.start,
             time: 0.0,
             distance: 0.0,
         };
-        frontier.push(start_node);
-        let start_cell = grid.cell_containing(&self.config.start);
-        visited.insert(start_cell, 0.0);
+        let mut layer = vec![start_node];
+        let start_key = self.point_key(&self.config.start);
+        visited.insert(start_key, 0.0);
         let _ = tracker.try_update(self.config.start, 0.0, &self.landmask);
 
         let mut isochrones = Vec::new();
         let mut next_isochrone_time = self.config.isochrone_step_hours * 3600.0;
 
-        let max_nodes = 3_000_000;
+        let max_nodes =
+            ((self.config.time_limit_hours * 120_000.0) as usize).clamp(500_000, 25_000_000);
         let mut nodes_explored = 0usize;
+        let mut current_time = 0.0;
 
-        while let Some(node) = frontier.pop() {
+        while current_time <= time_limit && !layer.is_empty() {
+            nodes_explored += layer.len();
             if nodes_explored >= max_nodes {
                 break;
             }
-            nodes_explored += 1;
 
-            if node.time > time_limit {
-                break;
+            let mut next_layer: Vec<Node> = Vec::new();
+
+            for node in layer {
+                if node.time > time_limit {
+                    continue;
+                }
+
+                if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
+                    continue;
+                }
+
+                if node.time > 0.0 {
+                    tracker.try_update(node.point, node.time, &self.landmask);
+                }
+
+                for successor in self.explore_directions(&node) {
+                    if successor.time > time_limit {
+                        continue;
+                    }
+                    if successor.time > 0.0 && !self.landmask.is_sea(&successor.point) {
+                        continue;
+                    }
+                    let skey = self.point_key(&successor.point);
+                    if successor.time + 1e-6
+                        >= visited.get(&skey).copied().unwrap_or(f64::INFINITY)
+                    {
+                        continue;
+                    }
+                    visited.insert(skey, successor.time);
+                    next_layer.push(successor);
+                }
             }
 
-            let cell_key = grid.cell_containing(&node.point);
-            if visited.get(&cell_key).copied().unwrap_or(f64::INFINITY) + 1e-6 < node.time {
-                continue;
-            }
-            visited.insert(cell_key, node.time);
-
-            if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
-                continue;
-            }
-
-            if node.time > 0.0 {
-                tracker.try_update(node.point, node.time, &self.landmask);
-            }
-
-            if node.time >= next_isochrone_time {
+            while next_isochrone_time <= current_time + step_seconds + 1e-6 {
                 let iso = tracker.build_isochrone_envelope(
                     next_isochrone_time,
                     iso_band,
@@ -138,17 +153,13 @@ impl IsochroneCalculator {
                     isochrones.push(iso);
                 }
                 next_isochrone_time += self.config.isochrone_step_hours * 3600.0;
+                if next_isochrone_time > time_limit + iso_band {
+                    break;
+                }
             }
 
-            for successor in self.explore_directions(&node, &grid) {
-                if successor.time > 0.0 && !self.landmask.is_sea(&successor.point) {
-                    continue;
-                }
-                let skey = grid.cell_containing(&successor.point);
-                if successor.time < visited.get(&skey).copied().unwrap_or(f64::INFINITY) {
-                    frontier.push(successor);
-                }
-            }
+            layer = next_layer;
+            current_time += step_seconds;
         }
 
         if next_isochrone_time <= time_limit + iso_band {
@@ -167,7 +178,7 @@ impl IsochroneCalculator {
     }
 
     /// Explore toutes les directions possibles depuis un nœud
-    fn explore_directions(&self, node: &Node, _grid: &RoutingGrid) -> Vec<Node> {
+    fn explore_directions(&self, node: &Node) -> Vec<Node> {
         let step_seconds = self.config.simulation_step_seconds();
         let current_time = self.start_time + Duration::seconds(node.time as i64);
         
