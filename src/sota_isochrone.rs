@@ -737,6 +737,11 @@ impl SotaIsochroneRouter {
         }
 
         let eff_dir = eff_vx.atan2(eff_vy).to_degrees().rem_euclid(360.0);
+        let track_twa = angle_au_vent(eff_dir, env.wind.direction);
+        if track_twa + 1e-6 < MIN_ANGLE_AU_VENT_DEG {
+            return None;
+        }
+
         let new_point = crate::geometry::move_from_point_fast(&node.point, eff_dir, distance);
         let dist_from_start = node.dist_from_start + distance;
         let cell_key = point_key_from_dist(&new_point, dist_from_start);

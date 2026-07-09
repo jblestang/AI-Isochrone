@@ -251,16 +251,16 @@ fn draw_route_wind(
     start_time: DateTime<Utc>,
     eta_hours: f64,
 ) {
-    let samples = if legs.is_empty() {
+    let samples: Vec<(Point, f64, f64, Option<Wind>, f64)> = if legs.is_empty() {
         samples_along_route_with_heading(route, headings, eta_hours, ROUTE_WIND_STEP_HOURS)
             .into_iter()
-            .map(|(pt, hdg, h)| (pt, hdg, h, None))
-            .collect::<Vec<_>>()
+            .map(|(pt, hdg, h)| (pt, hdg, h, None, hdg))
+            .collect()
     } else {
         samples_from_route_legs(legs, eta_hours, ROUTE_WIND_STEP_HOURS)
     };
 
-    for (point, heading, sim_hours, leg_wind) in samples {
+    for (point, heading, sim_hours, leg_wind, track_bearing) in samples {
         let wind = if let Some(w) = leg_wind {
             w
         } else {
@@ -271,16 +271,25 @@ fn draw_route_wind(
                 .unwrap_or(Wind::new(270.0, 10.0))
         };
         let twa = polar::angle_au_vent(heading, wind.direction);
+        let cog_twa = polar::angle_au_vent(track_bearing, wind.direction);
         let boat_kt = polar.speed_ms(twa, wind.speed) * 1.944;
+        if boat_kt < 0.5 {
+            continue;
+        }
         let color = wind_color_for_time(sim_hours, eta_hours);
         let (mut x, mut y) = vp.project(&point);
         x += 14;
         y -= 10;
-        draw_wind_arrow(img, x, y, &wind, color);
-        let label = format!(
-            "{:.0}h TWA {:.0}° boat {:.0}kt",
-            sim_hours, twa, boat_kt
-        );
+        draw_wind_from_arrow(img, x, y, &wind, color);
+        draw_boat_heading_arrow(img, x, y, heading, Rgba([255, 255, 255, 220]));
+        let label = if (twa - cog_twa).abs() > 8.0 {
+            format!(
+                "{:.0}h TWA {:.0}° COG {:.0}° {:.0}kt",
+                sim_hours, twa, cog_twa, boat_kt
+            )
+        } else {
+            format!("{:.0}h TWA {:.0}° {:.0}kt", sim_hours, twa, boat_kt)
+        };
         draw_text(
             img,
             x + 16,
@@ -295,27 +304,32 @@ fn samples_from_route_legs(
     legs: &[RouteLeg],
     eta_hours: f64,
     step_hours: f64,
-) -> Vec<(Point, f64, f64, Option<Wind>)> {
+) -> Vec<(Point, f64, f64, Option<Wind>, f64)> {
     if legs.is_empty() || eta_hours <= 0.0 {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut h = 0.0;
     while h <= eta_hours + 1e-3 {
-        if let Some((pt, heading, wind)) = point_on_legs_at_hour(legs, eta_hours, h) {
-            out.push((pt, heading, h, Some(wind)));
+        if let Some((pt, heading, wind, track)) = point_on_legs_at_hour(legs, eta_hours, h) {
+            out.push((pt, heading, h, Some(wind), track));
         }
         h += step_hours;
     }
-    if out.last().map(|(_, _, th, _)| (*th - eta_hours).abs()) > Some(1.0) {
-        if let Some((pt, heading, wind)) = point_on_legs_at_hour(legs, eta_hours, eta_hours) {
-            out.push((pt, heading, eta_hours, Some(wind)));
+    if out.last().map(|(_, _, th, _, _)| (*th - eta_hours).abs()) > Some(1.0) {
+        if let Some((pt, heading, wind, track)) = point_on_legs_at_hour(legs, eta_hours, eta_hours)
+        {
+            out.push((pt, heading, eta_hours, Some(wind), track));
         }
     }
     out
 }
 
-fn point_on_legs_at_hour(legs: &[RouteLeg], eta_hours: f64, hour: f64) -> Option<(Point, f64, Wind)> {
+fn point_on_legs_at_hour(
+    legs: &[RouteLeg],
+    eta_hours: f64,
+    hour: f64,
+) -> Option<(Point, f64, Wind, f64)> {
     let target = (hour / eta_hours).clamp(0.0, 1.0) * eta_hours;
     let mut cum = 0.0;
     for leg in legs {
@@ -327,11 +341,13 @@ fn point_on_legs_at_hour(legs: &[RouteLeg], eta_hours: f64, hour: f64) -> Option
                 0.0
             };
             let pt = interpolate_point(&leg.from, &leg.to, frac);
-            return Some((pt, leg.boat_heading_deg, leg.wind));
+            return Some((pt, leg.boat_heading_deg, leg.wind, leg.bearing_deg));
         }
         cum = end;
     }
-    legs.last().map(|leg| (leg.to, leg.boat_heading_deg, leg.wind))
+    legs
+        .last()
+        .map(|leg| (leg.to, leg.boat_heading_deg, leg.wind, leg.bearing_deg))
 }
 
 fn samples_along_route_with_heading(
@@ -451,14 +467,26 @@ fn wind_color_for_time(sim_hours: f64, eta_hours: f64) -> Rgba<u8> {
     ])
 }
 
-/// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
-fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
-    let to_deg = (wind.direction + 180.0).rem_euclid(360.0);
+/// Wind barb: arrow from upwind (where wind comes FROM) toward the sample point.
+fn draw_wind_from_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
+    let from_deg = wind.direction.rem_euclid(360.0);
     let len = (wind.speed * 3.0).clamp(18.0, 42.0) as i32;
-    let rad = to_deg.to_radians();
+    let rad = from_deg.to_radians();
+    let tx = cx + (rad.sin() * len as f64).round() as i32;
+    let ty = cy - (rad.cos() * len as f64).round() as i32;
+    draw_arrow_line(img, tx, ty, cx, cy, color);
+}
+
+/// Short white arrow showing boat heading (cap).
+fn draw_boat_heading_arrow(img: &mut RgbaImage, cx: i32, cy: i32, heading_deg: f64, color: Rgba<u8>) {
+    let len = 16i32;
+    let rad = heading_deg.to_radians();
     let ex = cx + (rad.sin() * len as f64).round() as i32;
     let ey = cy - (rad.cos() * len as f64).round() as i32;
+    draw_arrow_line(img, cx, cy, ex, ey, color);
+}
 
+fn draw_arrow_line(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
     let outline = Rgba([8, 25, 55, 255]);
     let head = Rgba([
         color[0].saturating_add(40),
@@ -466,25 +494,27 @@ fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rg
         color[2],
         255,
     ]);
-
-    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)] {
-        draw_thick_line(
-            img,
-            (cx + dx, cy + dy),
-            (ex + dx, ey + dy),
-            outline,
-            2,
-        );
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        draw_thick_line(img, (x0 + dx, y0 + dy), (x1 + dx, y1 + dy), outline, 2);
     }
-    draw_thick_line(img, (cx, cy), (ex, ey), color, 2);
-
+    draw_thick_line(img, (x0, y0), (x1, y1), color, 2);
+    let dir = ((x1 - x0) as f64).atan2((y0 - y1) as f64).to_degrees();
     for sign in [-1.0_f64, 1.0] {
-        let hr = (to_deg + 180.0 + sign * 24.0).to_radians();
-        let hx = ex + (hr.sin() * 9.0).round() as i32;
-        let hy = ey - (hr.cos() * 9.0).round() as i32;
-        draw_thick_line(img, (ex, ey), (hx, hy), head, 2);
+        let hr = (dir + 180.0 + sign * 24.0).to_radians();
+        let hx = x1 + (hr.sin() * 8.0).round() as i32;
+        let hy = y1 - (hr.cos() * 8.0).round() as i32;
+        draw_thick_line(img, (x1, y1), (hx, hy), head, 2);
     }
-    put_pixel_opaque(img, cx, cy, color);
+}
+
+/// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
+fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
+    let to_deg = (wind.direction + 180.0).rem_euclid(360.0);
+    let len = (wind.speed * 3.0).clamp(18.0, 42.0) as i32;
+    let rad = to_deg.to_radians();
+    let ex = cx + (rad.sin() * len as f64).round() as i32;
+    let ey = cy - (rad.cos() * len as f64).round() as i32;
+    draw_arrow_line(img, cx, cy, ex, ey, color);
 }
 
 fn draw_label_bar(

@@ -288,16 +288,18 @@ impl IsochroneCalculator {
         current: &Current,
         step_seconds: f64,
     ) -> Option<Node> {
-        // Calculer l'angle au vent
-        let angle_au_vent = angle_au_vent(heading, wind.direction);
-        
+        let twa = angle_au_vent(heading, wind.direction);
+        if twa + 1e-6 < crate::polar::MIN_ANGLE_AU_VENT_DEG {
+            return None;
+        }
+
         // Obtenir la vitesse du bateau depuis la polaire
-        let boat_speed_ms = self.polar.speed_ms(angle_au_vent, wind.speed);
+        let boat_speed_ms = self.polar.speed_ms(twa, wind.speed);
         
         // Debug pour diagnostiquer les problèmes de vitesse
         if (wind.speed - 15.0).abs() < 0.5 && boat_speed_ms < 0.1 {
             eprintln!("⚠️  Vitesse très faible détectée: wind={:.1}m/s, angle_au_vent={:.1}°, boat_speed_ms={:.4}m/s", 
-                     wind.speed, angle_au_vent, boat_speed_ms);
+                     wind.speed, twa, boat_speed_ms);
         }
         
         // Si la vitesse est trop faible, ignorer cette direction
@@ -312,6 +314,11 @@ impl IsochroneCalculator {
             heading,
             current,
         );
+
+        let track_twa = angle_au_vent(effective_direction, wind.direction);
+        if track_twa + 1e-6 < crate::polar::MIN_ANGLE_AU_VENT_DEG {
+            return None;
+        }
         
         // Distance parcourue en un pas de temps
         let distance = effective_speed * step_seconds;
