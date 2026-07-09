@@ -73,7 +73,7 @@ impl SimpleGribProvider {
         }
     }
 
-    /// Crée un provider avec des valeurs par défaut réalistes pour la zone Lorient-Toulon
+    /// Crée un provider avec des valeurs par défaut réalistes pour la zone Lorient-Bergen
     pub fn default() -> Self {
         // Vent moyen de secteur Ouest-Nord-Ouest (250-290°), 10 m/s (~20 nœuds)
         let wind = Wind::new(270.0, 10.0);

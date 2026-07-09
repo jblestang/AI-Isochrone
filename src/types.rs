@@ -375,7 +375,7 @@ impl Default for IsochroneConfig {
     fn default() -> Self {
         Self {
             start: Point::new(47.55, -3.48), // South of Île de Groix (open water)
-            destination: Some(Point::new(43.12, 5.93)), // Toulon
+            destination: Some(Point::new(60.39, 5.32)), // Bergen
             time_limit_hours: 24.0,
             isochrone_step_hours: 1.0,
             simulation_step_minutes: 10.0,

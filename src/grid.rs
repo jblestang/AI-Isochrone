@@ -260,7 +260,7 @@ mod tests {
     fn tracker_keeps_best_arrival_at_exact_coordinates() {
         let spec = GridSpec::from_route(
             Point::new(47.55, -3.48),
-            Some(Point::new(43.12, 5.93)),
+            Some(Point::new(60.39, 5.32)),
             0.5,
             1.0,
         );
@@ -284,7 +284,7 @@ mod tests {
     fn tracker_keeps_best_arrival_per_cell() {
         let spec = GridSpec::from_route(
             Point::new(47.55, -3.48),
-            Some(Point::new(43.12, 5.93)),
+            Some(Point::new(60.39, 5.32)),
             0.5,
             1.0,
         );

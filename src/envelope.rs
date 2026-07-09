@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn envelope_bands_are_non_overlapping() {
-        let dest = Point::new(43.12, 5.93);
+        let dest = Point::new(60.39, 5.32);
         let isochrones = vec![
             Isochrone {
                 time_hours: 10.0,

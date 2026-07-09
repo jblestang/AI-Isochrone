@@ -21,13 +21,13 @@ fn weather_seed() -> u64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Point::new(47.55, -3.48);
-    let dest = Point::new(43.12, 5.93);
+    let dest = Point::new(60.39, 5.32); // Bergen, Norway
 
     let config = SotaRoutingConfig {
         base: IsochroneConfig {
             start,
             destination: Some(dest),
-            time_limit_hours: 200.0,
+            time_limit_hours: 350.0,
             isochrone_step_hours: ISOCHRONE_STEP_HOURS,
             num_directions: 16,
             ..Default::default()
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "Computing Lorient → Toulon route ({} h isochrones, weather seed {})...",
+        "Computing Lorient → Bergen route ({} h isochrones, weather seed {})...",
         ISOCHRONE_STEP_HOURS,
         weather_seed()
     );
@@ -85,9 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn snapshot_path() -> PathBuf {
     let artifacts = PathBuf::from("/opt/cursor/artifacts");
     if artifacts.exists() {
-        artifacts.join("lorient-toulon-route.png")
+        artifacts.join("lorient-bergen-route.png")
     } else {
-        PathBuf::from("lorient-toulon-route.png")
+        PathBuf::from("lorient-bergen-route.png")
     }
 }
 
@@ -532,7 +532,7 @@ fn draw_label_bar(
         .unwrap_or_else(|| "No arrival".into());
     let sailed: f64 = result.route_legs.iter().map(|l| l.distance_nm).sum();
     let subtitle = format!(
-        "Lorient > Toulon | {} | {:.0} nm | {:.0}h isochrones | wind every {:.0}h on route",
+        "Lorient > Bergen | {} | {:.0} nm | {:.0}h isochrones | wind every {:.0}h on route",
         eta,
         sailed,
         ISOCHRONE_STEP_HOURS,
