@@ -9,10 +9,83 @@ use crate::polar::{angle_au_vent, Polar};
 use crate::route::{backtrack_route, build_route_legs, simplify_route};
 use crate::sea_state::{DefaultSeaStateModifier, SeaStatePolarModifier};
 use crate::types::*;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Optional runtime stats when `AI_ISOCHRONE_PROFILE=1`.
+#[derive(Debug, Default)]
+pub struct RoutingProfile {
+    pub layers: usize,
+    pub nodes_expanded: usize,
+    pub expansions: usize,
+    pub successors_raw: usize,
+    pub successors_kept: usize,
+    pub landmask_checks: usize,
+    pub visited_cells: usize,
+    pub expand_wall: Duration,
+    pub merge_wall: Duration,
+    pub backtrack_wall: Duration,
+}
+
+struct ProfileCounters {
+    layers: AtomicUsize,
+    nodes: AtomicUsize,
+    expansions: AtomicUsize,
+    succ_raw: AtomicUsize,
+    succ_kept: AtomicUsize,
+    landmask: AtomicUsize,
+}
+
+impl ProfileCounters {
+    fn enabled() -> bool {
+        std::env::var("AI_ISOCHRONE_PROFILE").is_ok()
+    }
+}
+
+impl Default for ProfileCounters {
+    fn default() -> Self {
+        Self {
+            layers: AtomicUsize::new(0),
+            nodes: AtomicUsize::new(0),
+            expansions: AtomicUsize::new(0),
+            succ_raw: AtomicUsize::new(0),
+            succ_kept: AtomicUsize::new(0),
+            landmask: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn print_routing_profile(p: &RoutingProfile) {
+    let total = p.expand_wall + p.merge_wall + p.backtrack_wall;
+    eprintln!("\n=== Routing profile ===");
+    eprintln!("Layers (10-min steps): {}", p.layers);
+    eprintln!("Nodes expanded:         {}", p.nodes_expanded);
+    eprintln!("Expansion calls:        {}", p.expansions);
+    eprintln!("Successors generated:   {} → {} kept after landmask", p.successors_raw, p.successors_kept);
+    eprintln!("Landmask point checks:  {}", p.landmask_checks);
+    eprintln!("Unique visited cells:   {}", p.visited_cells);
+    eprintln!("Wall time expand phase: {:.2?} ({:.0}%)", p.expand_wall, pct(p.expand_wall, total));
+    eprintln!("Wall time merge phase:  {:.2?} ({:.0}%)", p.merge_wall, pct(p.merge_wall, total));
+    eprintln!("Wall time backtrack:    {:.2?} ({:.0}%)", p.backtrack_wall, pct(p.backtrack_wall, total));
+    eprintln!(
+        "Avg per layer: {:.1} ms expand, {:.1} ms merge",
+        p.expand_wall.as_secs_f64() * 1000.0 / p.layers.max(1) as f64,
+        p.merge_wall.as_secs_f64() * 1000.0 / p.layers.max(1) as f64,
+    );
+}
+
+fn pct(part: Duration, total: Duration) -> f64 {
+    if total.is_zero() {
+        0.0
+    } else {
+        part.as_secs_f64() / total.as_secs_f64() * 100.0
+    }
+}
 
 /// Cached environment for time-invariant GRIB providers.
 #[derive(Clone, Copy)]
@@ -194,13 +267,25 @@ impl SotaIsochroneRouter {
 
         let env = self.resolve_env(base.start);
 
+        let profile_on = ProfileCounters::enabled();
+        let profile = Arc::new(ProfileCounters::default());
+        let mut expand_wall = Duration::ZERO;
+        let mut merge_wall = Duration::ZERO;
+
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
             if nodes_explored > max_nodes {
                 break;
             }
 
+            if profile_on {
+                profile.layers.fetch_add(1, Ordering::Relaxed);
+                profile.nodes.fetch_add(layer.len(), Ordering::Relaxed);
+            }
+
             let prune_before = best_arrival_time;
+            let t_expand = Instant::now();
+            let profile_ref = Arc::clone(&profile);
             let expansions: Vec<LayerExpansion> = layer
                 .par_iter()
                 .filter_map(|node| {
@@ -213,10 +298,13 @@ impl SotaIsochroneRouter {
                         &env,
                         track_cost,
                         prune_before,
+                        profile_on.then_some(profile_ref.as_ref()),
                     )
                 })
                 .collect();
+            expand_wall += t_expand.elapsed();
 
+            let t_merge = Instant::now();
             let mut next_layer: Vec<SotaNode> =
                 Vec::with_capacity(expansions.len().saturating_mul(6));
 
@@ -264,6 +352,7 @@ impl SotaIsochroneRouter {
                     ..succ
                 });
             }
+            merge_wall += t_merge.elapsed();
 
             if build_isos {
                 while next_iso_time <= current_time + step_seconds + 1e-6 {
@@ -309,6 +398,7 @@ impl SotaIsochroneRouter {
             }
         }
 
+        let t_back = Instant::now();
         let (best_route, best_eta_hours, best_cost, route_legs) = self.reconstruct_best_route(
             &arrival_records,
             &parent_map,
@@ -317,6 +407,23 @@ impl SotaIsochroneRouter {
             step_hours,
             self.config.optimize_cost,
         );
+        let backtrack_wall = t_back.elapsed();
+
+        if profile_on {
+            let report = RoutingProfile {
+                layers: profile.layers.load(Ordering::Relaxed),
+                nodes_expanded: profile.nodes.load(Ordering::Relaxed),
+                expansions: profile.expansions.load(Ordering::Relaxed),
+                successors_raw: profile.succ_raw.load(Ordering::Relaxed),
+                successors_kept: profile.succ_kept.load(Ordering::Relaxed),
+                landmask_checks: profile.landmask.load(Ordering::Relaxed),
+                visited_cells: visited.len(),
+                expand_wall,
+                merge_wall,
+                backtrack_wall,
+            };
+            print_routing_profile(&report);
+        }
 
         let mut arrival_envelopes = if self.config.build_arrival_envelopes {
             if let Some(dest_pt) = dest {
@@ -370,7 +477,7 @@ impl SotaIsochroneRouter {
         if self.grib.is_time_invariant() {
             cached
         } else {
-            let t = self.start_time + Duration::seconds(time as i64);
+            let t = self.start_time + ChronoDuration::seconds(time as i64);
             let (wind, current, sea_state) = self.grib.get_environment(&point, t);
             EnvSnapshot {
                 wind: wind.unwrap_or(cached.wind),
@@ -390,6 +497,7 @@ impl SotaIsochroneRouter {
         cached_env: &EnvSnapshot,
         track_cost: bool,
         best_arrival_time: f64,
+        profile: Option<&ProfileCounters>,
     ) -> Option<LayerExpansion> {
         if node.time > time_limit {
             return None;
@@ -410,6 +518,9 @@ impl SotaIsochroneRouter {
         }
 
         if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
+            if let Some(p) = profile {
+                p.landmask.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         }
 
@@ -448,12 +559,20 @@ impl SotaIsochroneRouter {
         }
 
         let points: Vec<Point> = raw_successors.iter().map(|s| s.point).collect();
+        if let Some(p) = profile {
+            p.expansions.fetch_add(1, Ordering::Relaxed);
+            p.succ_raw.fetch_add(raw_successors.len(), Ordering::Relaxed);
+            p.landmask.fetch_add(points.len(), Ordering::Relaxed);
+        }
         let are_sea = self.landmask.are_sea(&points);
         let successors: Vec<SotaNode> = raw_successors
             .into_iter()
             .enumerate()
             .filter_map(|(i, s)| are_sea.get(i).copied().unwrap_or(false).then_some(s))
             .collect();
+        if let Some(p) = profile {
+            p.succ_kept.fetch_add(successors.len(), Ordering::Relaxed);
+        }
 
         let arrival = self.arrival_record(node, key, dest);
 
