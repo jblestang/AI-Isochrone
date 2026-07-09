@@ -1,5 +1,5 @@
 use ai_isochrone::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -7,8 +7,9 @@ use std::time::Instant;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 1200;
-const ISOCHRONE_STEP_HOURS: f64 = 3.0;
+const ISOCHRONE_STEP_HOURS: f64 = 12.0;
 const DEFAULT_WEATHER_SEED: u64 = 42;
+const TITLE_BAR_H: u32 = 64;
 
 fn weather_seed() -> u64 {
     std::env::var("AI_ISOCHRONE_WEATHER_SEED")
@@ -44,18 +45,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let landmask = Landmask::new()?;
     let start_time = Utc::now();
+    let seed = weather_seed();
+    let grib = simulation_grib(seed).with_epoch(start_time);
     let result = calculate_sota_routing(
         config,
         ObjectiveWeights::default(),
         landmask.clone(),
         Box::new(SimplePolar::default_voilier()),
-        Box::new(simulation_grib(weather_seed()).with_epoch(start_time)),
+        Box::new(grib.clone()),
         start_time,
     );
     let compute_time = t0.elapsed();
 
     let out_path = snapshot_path();
-    render_snapshot(&result, &landmask, start, dest, &out_path)?;
+    render_snapshot(
+        &result,
+        &landmask,
+        &grib,
+        start_time,
+        seed,
+        start,
+        dest,
+        &out_path,
+    )?;
 
     let sailed: f64 = result.route_legs.iter().map(|l| l.distance_nm).sum();
     println!("Saved snapshot: {}", out_path.display());
@@ -123,6 +135,9 @@ impl Viewport {
 fn render_snapshot(
     result: &SotaRoutingResult,
     landmask: &Landmask,
+    grib: &SeededWindGribProvider,
+    start_time: DateTime<Utc>,
+    seed: u64,
     start: Point,
     dest: Point,
     path: &PathBuf,
@@ -159,14 +174,18 @@ fn render_snapshot(
         img.put_pixel(x, y, land);
     }
 
-    // Isochrone rings (when computed)
+    // Wind field (speed + direction arrows on sea)
+    draw_wind_field(&mut img, &vp, landmask, grib, start_time);
+
+    // Isochrone rings (12 h steps)
     if !result.isochrones.is_empty() {
         let iso_colors = [
-            Rgba([255, 80, 80, 180]),
-            Rgba([255, 160, 60, 180]),
-            Rgba([255, 230, 80, 180]),
-            Rgba([120, 220, 80, 180]),
-            Rgba([80, 180, 255, 180]),
+            Rgba([255, 90, 90, 200]),
+            Rgba([255, 180, 70, 200]),
+            Rgba([255, 240, 90, 200]),
+            Rgba([130, 230, 90, 200]),
+            Rgba([90, 190, 255, 200]),
+            Rgba([180, 130, 255, 200]),
         ];
         for (idx, iso) in result.isochrones.iter().enumerate() {
             let color = iso_colors[idx % iso_colors.len()];
@@ -174,10 +193,19 @@ fn render_snapshot(
                 let (x, y) = vp.project(pt);
                 draw_dot(&mut img, x, y, 2, color);
             }
+            if let Some(label_pt) = iso
+                .points
+                .iter()
+                .max_by(|a, b| start.distance_to(a).partial_cmp(&start.distance_to(b)).unwrap())
+            {
+                let (lx, ly) = vp.project(label_pt);
+                let label = format!("{:.0}h", iso.time_hours);
+                draw_text(&mut img, lx + 6, ly - 4, &label, Rgba([255, 255, 255, 255]));
+            }
         }
     }
 
-    // Best route
+    // Optimal route
     if let Some(route) = &result.best_route {
         let route_color = Rgba([255, 40, 40, 255]);
         for w in route.windows(2) {
@@ -191,31 +219,106 @@ fn render_snapshot(
     draw_marker(&mut img, vp.project(&start), Rgba([50, 255, 100, 255]), 8);
     draw_marker(&mut img, vp.project(&dest), Rgba([255, 50, 50, 255]), 10);
 
-    // Title bar
-    fill_rect(&mut img, 0, 0, WIDTH, 48, Rgba([15, 25, 40, 220]));
-    draw_label_bar(&mut img, result);
+    // Title bar + legend
+    fill_rect(&mut img, 0, 0, WIDTH, TITLE_BAR_H, Rgba([15, 25, 40, 230]));
+    draw_label_bar(&mut img, result, grib, start_time, seed, start);
 
     img.save(path)?;
     Ok(())
 }
 
-fn draw_label_bar(img: &mut RgbaImage, result: &SotaRoutingResult) {
+fn draw_wind_field(
+    img: &mut RgbaImage,
+    vp: &Viewport,
+    landmask: &Landmask,
+    grib: &SeededWindGribProvider,
+    start_time: DateTime<Utc>,
+) {
+    let step = 56u32;
+    let arrow_color = Rgba([140, 210, 255, 210]);
+    let mut y = TITLE_BAR_H + step / 2;
+    while y < HEIGHT {
+        let mut x = step / 2;
+        while x < WIDTH {
+            let point = vp.unproject(x, y);
+            if landmask.is_land(&point) {
+                x += step;
+                continue;
+            }
+            let wind = grib
+                .get_wind(&point, start_time)
+                .unwrap_or(Wind::new(270.0, 10.0));
+            draw_wind_arrow(img, x as i32, y as i32, &wind, arrow_color);
+            x += step;
+        }
+        y += step;
+    }
+}
+
+/// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
+fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
+    let to_deg = (wind.direction + 180.0).rem_euclid(360.0);
+    let len = (wind.speed * 2.2).clamp(10.0, 30.0) as i32;
+    let rad = to_deg.to_radians();
+    let ex = cx + (rad.sin() * len as f64).round() as i32;
+    let ey = cy - (rad.cos() * len as f64).round() as i32;
+    draw_line(img, (cx, cy), (ex, ey), color);
+    for sign in [-1.0_f64, 1.0] {
+        let hr = (to_deg + 180.0 + sign * 22.0).to_radians();
+        let hx = ex + (hr.sin() * 5.0).round() as i32;
+        let hy = ey - (hr.cos() * 5.0).round() as i32;
+        draw_line(img, (ex, ey), (hx, hy), color);
+    }
+}
+
+fn draw_label_bar(
+    img: &mut RgbaImage,
+    result: &SotaRoutingResult,
+    grib: &SeededWindGribProvider,
+    start_time: DateTime<Utc>,
+    seed: u64,
+    start: Point,
+) {
     let eta = result
         .best_eta_hours
         .map(|h| format!("ETA {:.0}h ({:.1}d)", h, h / 24.0))
         .unwrap_or_else(|| "No arrival".into());
     let sailed: f64 = result.route_legs.iter().map(|l| l.distance_nm).sum();
     let subtitle = format!(
-        "Lorient → Toulon | {} | {:.0} nm sailed | {:.0}h isochrones x{}",
+        "Lorient > Toulon | {} | {:.0} nm | {:.0}h isochrones x{} | optimal route",
         eta,
         sailed,
         ISOCHRONE_STEP_HOURS,
         result.isochrones.len()
     );
 
-    // Simple 5x7 bitmap font for ASCII labels
-    draw_text(img, 16, 10, "AI Isochrone Routing", Rgba([240, 240, 255, 255]));
-    draw_text(img, 16, 28, &subtitle, Rgba([180, 200, 230, 255]));
+    let w0 = grib.get_wind(&start, start_time).unwrap();
+    let w_mid = grib
+        .get_wind(
+            &start,
+            start_time + chrono::Duration::hours((result.best_eta_hours.unwrap_or(96.0) / 2.0) as i64),
+        )
+        .unwrap();
+    let wind_line = format!(
+        "Wind t0: {:.0}deg {:.1}kt | t+{:.0}h: {:.0}deg {:.1}kt | seed {}",
+        w0.direction,
+        w0.speed * 1.944,
+        result.best_eta_hours.unwrap_or(96.0) / 2.0,
+        w_mid.direction,
+        w_mid.speed * 1.944,
+        seed
+    );
+
+    draw_text(img, 16, 8, "AI Isochrone Routing", Rgba([240, 240, 255, 255]));
+    draw_text(img, 16, 24, &subtitle, Rgba([180, 200, 230, 255]));
+    draw_text(img, 16, 42, &wind_line, Rgba([150, 220, 255, 255]));
+    draw_text(
+        img,
+        WIDTH as i32 - 220,
+        42,
+        "arrows = wind",
+        Rgba([150, 220, 255, 255]),
+    );
 }
 
 fn draw_text(img: &mut RgbaImage, mut x: i32, y: i32, text: &str, color: Rgba<u8>) {
@@ -259,9 +362,25 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
         'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
         'V' => [0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
         'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        'k' => [0x00, 0x04, 0x04, 0x0E, 0x12, 0x12, 0x0E],
+        't' => [0x04, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x06],
+        'd' => [0x02, 0x02, 0x0E, 0x12, 0x12, 0x12, 0x0E],
+        'g' => [0x00, 0x00, 0x0E, 0x10, 0x12, 0x12, 0x0E],
+        'h' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11],
+        'm' => [0x00, 0x00, 0x1A, 0x15, 0x15, 0x11, 0x11],
+        'n' => [0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11],
+        'o' => [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E],
+        'r' => [0x00, 0x00, 0x16, 0x18, 0x10, 0x10, 0x10],
+        's' => [0x00, 0x00, 0x0E, 0x10, 0x0E, 0x01, 0x1E],
+        'u' => [0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'w' => [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A],
+        'x' => [0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11],
         '0'..='9' => digit_glyph(ch),
         '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+        '+' => [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
+        '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
         ' ' => [0x00; 7],
         '→' | '>' => [0x04, 0x02, 0x1F, 0x02, 0x04, 0x00, 0x00],
         '|' => [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
