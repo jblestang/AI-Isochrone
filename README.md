@@ -168,8 +168,8 @@ let result = calculate_sota_routing(
 Isochrones are computed on a **regular lat/lon grid** aligned with GRIB spacing when available:
 
 1. Precompute sea-only grid cells (land excluded)
-2. Snap each wavefront arrival to the nearest sea grid cell
-3. Keep **one best arrival time** per cell
+2. Wavefront expansion at **exact simulation coordinates** — arrival time recorded at each precise point
+3. Bin each sea point into its containing grid cell; keep **one best (earliest) arrival** per cell
 4. Extract the **outward envelope** (farthest point per bearing sector from start)
 
 Configure via `IsochroneConfig.grid_step_deg` (optional) and `envelope_sector_deg` (default 10°).
