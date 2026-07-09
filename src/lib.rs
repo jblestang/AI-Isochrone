@@ -8,6 +8,11 @@ pub mod objective;
 pub mod sea_state;
 pub mod envelope;
 pub mod sota_isochrone;
+pub mod constraints;
+pub mod route;
+pub mod scenario;
+pub mod ensemble;
+pub mod opponent;
 
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -25,3 +30,8 @@ pub use objective::*;
 pub use sea_state::*;
 pub use envelope::*;
 pub use sota_isochrone::*;
+pub use constraints::*;
+pub use route::*;
+pub use scenario::*;
+pub use ensemble::*;
+pub use opponent::*;

@@ -41,6 +41,38 @@ For a destination point, visualize **bands of points** that reach the target wit
 - `build_arrival_envelopes()` — boundary polygons per time band
 - Toggle **Isochrones / Envelopes / Both** in the GUI
 
+### Hard routing constraints
+
+- `RoutingConstraints`: max true wind, max significant wave height, optional min depth
+- Nodes violating limits are pruned before cost evaluation (`constraints` module)
+- Optimistic ETA lower bound for destination-cone pruning
+
+### Route reconstruction & export
+
+- `backtrack_route()` — parent-map backtracking from best arrival
+- `build_route_legs()` — tack detection, leg metadata (wind, sea state)
+- `route_to_gpx()` — GPX export (native GUI)
+
+### Weather scenarios & ensemble routing
+
+- `WeatherScenario` presets: baseline, front early/late, conservative (P90 wind)
+- `ScenarioGribProvider` — time-shifted / scaled GRIB for divergent scenarios
+- `EnsembleGribProvider` — multi-member wind spread
+- `eta_percentiles_from_results()` — P10 / P50 / P90 ETA from scenario fan
+
+### Opponent routing (dual isochrones)
+
+- `calculate_dual_routing()` — parallel routing for you vs opponent
+- `ScaledPolar` — opponent speed factor vs reference polar
+- `compute_cover_headings()` — mark-centric cover cone headings
+- `tack_decision_eta()` — optimistic tack comparison helper
+- GUI **Dual** button: opponent isochrones (magenta), ETA delta, scenario route fan
+
+### Coastal land handling
+
+- One land hop allowed from sea (or from start) so harbor departures reach open water
+- Prevents spurious empty isochrones with spatial GRIB grids near the coast
+
 ### Land avoidance
 
 - **Native**: `roaring-landmask` (GSHHG, full accuracy)
@@ -115,11 +147,17 @@ let result = calculate_sota_routing(
 
 ### GUI controls
 
+- **Compute** — solo SOTA routing
+- **Dual** — opponent + multi-scenario route fan
+- **Opponent** position / polar scale controls
+- **Scenario** checkboxes (baseline, front early/late, conservative)
+- **Constraints** panel (max wind, max Hs)
+- **P10 / P50 / P90** ETA display after dual run
+- **Export GPX** (native) for best route
 - **λ₁–λ₄ sliders** — objective weights
 - **Envelope band (min)** — minutes between arrival envelope rings
 - **Use GRIB/BUFR grid** — synthetic spatial wind/current/wave grid
 - **Optimize composite cost J** — cost-based vs time-only wavefront
-- **Compute** — runs routing in background (native thread / wasm async)
 
 ---
 
@@ -131,6 +169,11 @@ let result = calculate_sota_routing(
 | `sea_state` | Polar modification for waves |
 | `sota_isochrone` | Multi-criteria wavefront router |
 | `envelope` | Destination arrival envelope builder |
+| `constraints` | Hard wind/wave limits & optimistic ETA |
+| `route` | Route backtrack, legs, GPX export |
+| `scenario` | Divergent weather scenario GRIB wrapper |
+| `ensemble` | Multi-member GRIB & ETA percentiles |
+| `opponent` | Dual-boat routing & cover headings |
 | `grib` | Wind / current / sea-state providers |
 | `gui` | Egui + walkers map (native + wasm) |
 | `web` | Wasm `WebHandle` entry point |

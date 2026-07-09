@@ -1,6 +1,14 @@
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
+fn normalize_angle_deg(angle: f64) -> f64 {
+    let mut normalized = angle % 360.0;
+    if normalized < 0.0 {
+        normalized += 360.0;
+    }
+    normalized
+}
+
 /// Point géographique avec latitude et longitude
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Point {
@@ -60,7 +68,7 @@ impl Point {
 }
 
 /// Direction du vent en degrés (0-360, 0 = Nord)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Wind {
     pub direction: f64, // Direction d'où vient le vent (0-360)
     pub speed: f64,     // Vitesse du vent en m/s
@@ -69,14 +77,14 @@ pub struct Wind {
 impl Wind {
     pub fn new(direction: f64, speed: f64) -> Self {
         Self {
-            direction: direction % 360.0,
+            direction: normalize_angle_deg(direction),
             speed,
         }
     }
 }
 
 /// Courant marin
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Current {
     pub direction: f64, // Direction du courant en degrés (0-360, 0 = Nord)
     pub speed: f64,     // Vitesse du courant en m/s
@@ -85,7 +93,7 @@ pub struct Current {
 impl Current {
     pub fn new(direction: f64, speed: f64) -> Self {
         Self {
-            direction: direction % 360.0,
+            direction: normalize_angle_deg(direction),
             speed,
         }
     }
@@ -125,9 +133,160 @@ impl SeaState {
         Self {
             significant_wave_height_m: hs,
             wave_period_s: period,
-            wave_direction_deg: direction % 360.0,
+            wave_direction_deg: normalize_angle_deg(direction),
         }
     }
+}
+
+/// Hard routing limits (pruned before cost evaluation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConstraints {
+    pub max_true_wind_ms: Option<f64>,
+    pub max_significant_wave_m: Option<f64>,
+    pub min_depth_m: Option<f64>,
+}
+
+impl Default for RoutingConstraints {
+    fn default() -> Self {
+        Self {
+            max_true_wind_ms: Some(25.0),
+            max_significant_wave_m: Some(4.0),
+            min_depth_m: None,
+        }
+    }
+}
+
+impl RoutingConstraints {
+    pub fn unlimited() -> Self {
+        Self {
+            max_true_wind_ms: None,
+            max_significant_wave_m: None,
+            min_depth_m: None,
+        }
+    }
+}
+
+/// Opponent / rival boat for dual routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpponentState {
+    pub label: String,
+    pub position: Point,
+    /// Speed factor vs reference polar (1.0 = same boat, 0.85 = slower)
+    pub polar_scale: f64,
+    pub start_time_offset_hours: f64,
+}
+
+impl Default for OpponentState {
+    fn default() -> Self {
+        Self {
+            label: "Opponent".into(),
+            position: Point::new(47.85, -3.20),
+            polar_scale: 0.92,
+            start_time_offset_hours: 0.0,
+        }
+    }
+}
+
+/// One leg of a reconstructed route
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteLeg {
+    pub from: Point,
+    pub to: Point,
+    pub bearing_deg: f64,
+    pub distance_nm: f64,
+    pub duration_hours: f64,
+    pub is_tack: bool,
+    pub wind: Wind,
+    pub sea_state: SeaState,
+}
+
+/// Divergent weather scenario (ensemble member or shifted front)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeatherScenario {
+    pub id: String,
+    pub label: String,
+    /// Time shift applied to GRIB validity (hours)
+    pub time_shift_hours: f64,
+    /// Wind speed multiplier
+    pub wind_speed_factor: f64,
+    /// Wind direction offset (degrees)
+    pub wind_direction_offset_deg: f64,
+}
+
+impl WeatherScenario {
+    pub fn baseline() -> Self {
+        Self {
+            id: "baseline".into(),
+            label: "Baseline GRIB".into(),
+            time_shift_hours: 0.0,
+            wind_speed_factor: 1.0,
+            wind_direction_offset_deg: 0.0,
+        }
+    }
+
+    pub fn front_early() -> Self {
+        Self {
+            id: "front_early".into(),
+            label: "Front 6h early".into(),
+            time_shift_hours: -6.0,
+            wind_speed_factor: 1.1,
+            wind_direction_offset_deg: 15.0,
+        }
+    }
+
+    pub fn front_late() -> Self {
+        Self {
+            id: "front_late".into(),
+            label: "Front 6h late".into(),
+            time_shift_hours: 6.0,
+            wind_speed_factor: 0.9,
+            wind_direction_offset_deg: -10.0,
+        }
+    }
+
+    pub fn conservative() -> Self {
+        Self {
+            id: "p90_wind".into(),
+            label: "P90 wind (conservative)".into(),
+            time_shift_hours: 0.0,
+            wind_speed_factor: 1.15,
+            wind_direction_offset_deg: 0.0,
+        }
+    }
+}
+
+/// ETA percentiles from multi-scenario / ensemble runs
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct EtaPercentiles {
+    pub p10_hours: f64,
+    pub p50_hours: f64,
+    pub p90_hours: f64,
+}
+
+/// Result of SOTA isochrone computation
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SotaRoutingResult {
+    pub isochrones: Vec<Isochrone>,
+    pub arrival_envelopes: Vec<ArrivalEnvelope>,
+    pub best_route: Option<Vec<Point>>,
+    pub route_legs: Vec<RouteLeg>,
+    pub best_eta_hours: Option<f64>,
+    pub best_cost: Option<f64>,
+    pub scenario_id: Option<String>,
+    pub eta_percentiles: Option<EtaPercentiles>,
+}
+
+/// Dual-boat routing result (opponent routing)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DualRoutingResult {
+    pub mine: SotaRoutingResult,
+    pub opponent: SotaRoutingResult,
+    /// My ETA minus opponent ETA at mark (negative = I'm faster)
+    pub eta_delta_hours: Option<f64>,
+    /// Suggested headings that keep mark between us and opponent
+    pub cover_headings_deg: Vec<f64>,
+    pub scenario_results: Vec<SotaRoutingResult>,
+    pub combined_eta_percentiles: Option<EtaPercentiles>,
 }
 
 /// Extended configuration for SOTA multi-criteria isochrone routing
@@ -140,6 +299,10 @@ pub struct SotaRoutingConfig {
     pub arrival_radius_m: f64,
     /// Use composite cost J instead of pure time for pruning
     pub optimize_cost: bool,
+    pub constraints: RoutingConstraints,
+    /// Prune nodes whose optimistic ETA exceeds best known + slack (hours)
+    pub destination_prune_slack_hours: f64,
+    pub enable_destination_prune: bool,
 }
 
 impl Default for SotaRoutingConfig {
@@ -149,6 +312,9 @@ impl Default for SotaRoutingConfig {
             envelope_step_minutes: 30.0,
             arrival_radius_m: 5000.0,
             optimize_cost: true,
+            constraints: RoutingConstraints::default(),
+            destination_prune_slack_hours: 4.0,
+            enable_destination_prune: true,
         }
     }
 }
@@ -160,16 +326,6 @@ pub struct ArrivalEnvelope {
     pub max_eta_hours: f64,
     /// Upwind / departure-side boundary points forming the envelope
     pub boundary_points: Vec<Point>,
-}
-
-/// Result of SOTA isochrone computation
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SotaRoutingResult {
-    pub isochrones: Vec<Isochrone>,
-    pub arrival_envelopes: Vec<ArrivalEnvelope>,
-    pub best_route: Option<Vec<Point>>,
-    pub best_eta_hours: Option<f64>,
-    pub best_cost: Option<f64>,
 }
 
 /// Configuration pour le calcul d'isochrone
