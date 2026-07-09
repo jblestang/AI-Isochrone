@@ -36,7 +36,7 @@ struct Args {
     simulation_step_minutes: f64,
 
     /// Nombre de directions à explorer
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     num_directions: usize,
 
     /// Fichier de sortie pour les résultats (JSON)

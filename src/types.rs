@@ -360,7 +360,7 @@ pub struct IsochroneConfig {
     pub isochrone_step_hours: f64, // Intervalle entre isochrones (1h)
     pub simulation_step_minutes: f64, // Pas de simulation (10 min)
     pub max_distance_meters: f64, // Distance maximale pour un pas de 10 min
-    pub num_directions: usize, // Nombre de directions explorées (ex: 16 pour 22.5°)
+    pub num_directions: usize, // Nombre de directions explorées (ex: 8 pour 45°)
     /// Routing/isochrone grid step in degrees. When `None`, uses GRIB grid or 0.25° default.
     pub grid_step_deg: Option<f64>,
     /// Bearing sector width for outward isochrone envelope extraction.
@@ -376,7 +376,7 @@ impl Default for IsochroneConfig {
             isochrone_step_hours: 1.0,
             simulation_step_minutes: 10.0,
             max_distance_meters: 50000.0, // ~50 km max par pas (27 nœuds max)
-            num_directions: 16, // 16 directions = 22.5° entre chaque
+            num_directions: 8, // 8 directions = 45° entre chaque
             grid_step_deg: None,
             envelope_sector_deg: 10.0,
         }

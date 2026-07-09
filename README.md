@@ -126,7 +126,7 @@ let config = SotaRoutingConfig::default();
 let weights = ObjectiveWeights {
     lambda_wave_risk: 1.0,
     lambda_comfort: 0.5,
-    lambda_manoeuvre: 0.3,
+    lambda_manoeuvre: 1.5,
     lambda_safety: 2.0,
     ..Default::default()
 };
