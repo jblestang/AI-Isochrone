@@ -7,19 +7,31 @@ use std::time::Instant;
 
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 1200;
+const ISOCHRONE_STEP_HOURS: f64 = 3.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Point::new(47.55, -3.48);
     let dest = Point::new(43.12, 5.93);
 
-    let config = SotaRoutingConfig::route_only(IsochroneConfig {
-        start,
-        destination: Some(dest),
-        time_limit_hours: 200.0,
+    let config = SotaRoutingConfig {
+        base: IsochroneConfig {
+            start,
+            destination: Some(dest),
+            time_limit_hours: 200.0,
+            isochrone_step_hours: ISOCHRONE_STEP_HOURS,
+            ..Default::default()
+        },
+        build_isochrones: true,
+        build_arrival_envelopes: false,
+        stop_on_arrival: true,
+        optimize_cost: false,
         ..Default::default()
-    });
+    };
 
-    println!("Computing Lorient → Toulon route...");
+    println!(
+        "Computing Lorient → Toulon route ({} h isochrones)...",
+        ISOCHRONE_STEP_HOURS
+    );
     let t0 = Instant::now();
     let landmask = Landmask::new()?;
     let result = calculate_sota_routing(
@@ -110,9 +122,7 @@ fn render_snapshot(
         points.extend(route.iter().copied());
     }
     for iso in &result.isochrones {
-        if (iso.time_hours as u32) % 20 == 0 {
-            points.extend(iso.points.iter().copied());
-        }
+        points.extend(iso.points.iter().copied());
     }
     if let Some(route) = &result.best_route {
         points.extend(route.iter().copied());
@@ -149,16 +159,6 @@ fn render_snapshot(
             Rgba([80, 180, 255, 180]),
         ];
         for (idx, iso) in result.isochrones.iter().enumerate() {
-            if (iso.time_hours as u32) % 20 != 0
-                && iso.time_hours
-                    != result
-                        .isochrones
-                        .last()
-                        .map(|i| i.time_hours)
-                        .unwrap_or(0.0)
-            {
-                continue;
-            }
             let color = iso_colors[idx % iso_colors.len()];
             for pt in &iso.points {
                 let (x, y) = vp.project(pt);
@@ -196,9 +196,10 @@ fn draw_label_bar(img: &mut RgbaImage, result: &SotaRoutingResult) {
         .unwrap_or_else(|| "No arrival".into());
     let sailed: f64 = result.route_legs.iter().map(|l| l.distance_nm).sum();
     let subtitle = format!(
-        "Lorient → Toulon | {} | {:.0} nm sailed | {} isochrones",
+        "Lorient → Toulon | {} | {:.0} nm sailed | {:.0}h isochrones x{}",
         eta,
         sailed,
+        ISOCHRONE_STEP_HOURS,
         result.isochrones.len()
     );
 
