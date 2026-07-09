@@ -8,6 +8,14 @@ use std::time::Instant;
 const WIDTH: u32 = 1600;
 const HEIGHT: u32 = 1200;
 const ISOCHRONE_STEP_HOURS: f64 = 3.0;
+const DEFAULT_WEATHER_SEED: u64 = 42;
+
+fn weather_seed() -> u64 {
+    std::env::var("AI_ISOCHRONE_WEATHER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WEATHER_SEED)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Point::new(47.55, -3.48);
@@ -29,18 +37,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "Computing Lorient → Toulon route ({} h isochrones)...",
-        ISOCHRONE_STEP_HOURS
+        "Computing Lorient → Toulon route ({} h isochrones, weather seed {})...",
+        ISOCHRONE_STEP_HOURS,
+        weather_seed()
     );
     let t0 = Instant::now();
     let landmask = Landmask::new()?;
+    let start_time = Utc::now();
     let result = calculate_sota_routing(
         config,
         ObjectiveWeights::default(),
         landmask.clone(),
         Box::new(SimplePolar::default_voilier()),
-        Box::new(SimpleGribProvider::default()),
-        Utc::now(),
+        Box::new(simulation_grib(weather_seed()).with_epoch(start_time)),
+        start_time,
     );
     let compute_time = t0.elapsed();
 

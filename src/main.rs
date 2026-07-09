@@ -42,6 +42,10 @@ struct Args {
     /// Fichier de sortie pour les résultats (JSON)
     #[arg(long)]
     output: Option<String>,
+
+    /// Seed for reproducible time-varying wind during the simulation
+    #[arg(long, default_value_t = 42)]
+    weather_seed: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,8 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let polar: Box<dyn Polar + Send + Sync> = Box::new(polar::SimplePolar::default_voilier());
 
     println!("   - Configuration du provider GRIB...");
-    let grib_provider: Box<dyn GribProvider + Send + Sync> = 
-        Box::new(grib::SimpleGribProvider::default());
+    let start_datetime = Utc::now();
+    let grib_provider: Box<dyn GribProvider + Send + Sync> =
+        Box::new(grib::simulation_grib(args.weather_seed).with_epoch(start_datetime));
+    println!("   - Vent variable (seed {})", args.weather_seed);
 
     let init_time = start_time.elapsed();
     println!("   ✓ Initialisation terminée en {:.2?}\n", init_time);
@@ -96,7 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Calcul des isochrones
     println!("🧮 Calcul des isochrones...");
     let calc_start = Instant::now();
-    let start_datetime = Utc::now();
 
     let isochrones = calculate_isochrones(
         config.clone(),

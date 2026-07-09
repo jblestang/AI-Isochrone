@@ -2,13 +2,27 @@ use ai_isochrone::*;
 use chrono::Utc;
 use std::time::Instant;
 
+const DEFAULT_WEATHER_SEED: u64 = 42;
+
+fn weather_seed() -> u64 {
+    std::env::var("AI_ISOCHRONE_WEATHER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WEATHER_SEED)
+}
+
 fn main() {
     let start = Point::new(47.55, -3.48);
     let dest = Point::new(43.12, 5.93);
     let direct_nm = start.distance_to(&dest) / 1852.0;
 
     println!("Lorient (south of Groix) → Toulon");
-    println!("Direct rhumb: {:.0} nm\n", direct_nm);
+    println!("Direct rhumb: {:.0} nm", direct_nm);
+    let seed = std::env::var("AI_ISOCHRONE_WEATHER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42u64);
+    println!("Weather seed: {}\n", seed);
 
     let config = SotaRoutingConfig::route_only(IsochroneConfig {
         start,
@@ -18,14 +32,16 @@ fn main() {
     });
 
     let time_limit_hours = config.base.time_limit_hours;
+    let seed = weather_seed();
+    let start_time = Utc::now();
     let t0 = Instant::now();
     let r = calculate_sota_routing(
         config,
         ObjectiveWeights::default(),
         Landmask::new().unwrap(),
         Box::new(SimplePolar::default_voilier()),
-        Box::new(SimpleGribProvider::default()),
-        Utc::now(),
+        Box::new(simulation_grib(seed).with_epoch(start_time)),
+        start_time,
     );
     println!("Router ({:.1?}): {} isochrones, last {:.0} h, reach {:.0} nm",
         t0.elapsed(),

@@ -302,7 +302,7 @@ impl SotaIsochroneRouter {
             .map(|i| i as f64 * base.direction_step_degrees())
             .collect();
 
-        let env = self.resolve_env(base.start);
+        let env = self.resolve_env(base.start, 0.0);
         let time_invariant = self.grib.is_time_invariant();
         let cached_kinematics = self.build_heading_kinematics(&headings, &env);
 
@@ -330,7 +330,7 @@ impl SotaIsochroneRouter {
                 &cached_kinematics
             } else {
                 layer_kinematics =
-                    self.build_heading_kinematics(&headings, &self.resolve_env(layer[0].point));
+                    self.build_heading_kinematics(&headings, &self.resolve_env(layer[0].point, current_time));
                 &layer_kinematics
             };
             let t_expand = Instant::now();
@@ -526,7 +526,8 @@ impl SotaIsochroneRouter {
         }
     }
 
-    fn resolve_env(&self, at: Point) -> EnvSnapshot {
+    fn resolve_env(&self, at: Point, sim_time: f64) -> EnvSnapshot {
+        let t = self.start_time + ChronoDuration::seconds(sim_time as i64);
         let (wind, current, sea_state) = if self.grib.is_time_invariant() {
             let (wind, current, sea_state) = self.grib.get_environment(&at, self.start_time);
             (
@@ -535,10 +536,11 @@ impl SotaIsochroneRouter {
                 sea_state.unwrap_or(SeaState::new(1.0, 8.0, 270.0)),
             )
         } else {
+            let (wind, current, sea_state) = self.grib.get_environment(&at, t);
             (
-                Wind::new(270.0, 10.0),
-                Current::new(90.0, 0.5),
-                SeaState::new(1.0, 8.0, 270.0),
+                wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current.unwrap_or(Current::new(90.0, 0.5)),
+                sea_state.unwrap_or(SeaState::new(1.0, 8.0, 270.0)),
             )
         };
         let current_dir_rad = current.direction.to_radians();
@@ -572,17 +574,7 @@ impl SotaIsochroneRouter {
         if self.grib.is_time_invariant() {
             cached
         } else {
-            let t = self.start_time + ChronoDuration::seconds(time as i64);
-            let (wind, current, sea_state) = self.grib.get_environment(&point, t);
-            let current = current.unwrap_or(cached.current);
-            let current_dir_rad = current.direction.to_radians();
-            EnvSnapshot {
-                wind: wind.unwrap_or(cached.wind),
-                current,
-                sea_state: sea_state.unwrap_or(cached.sea_state),
-                current_vx: current.speed * current_dir_rad.sin(),
-                current_vy: current.speed * current_dir_rad.cos(),
-            }
+            self.resolve_env(point, time)
         }
     }
 

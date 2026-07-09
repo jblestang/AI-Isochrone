@@ -118,7 +118,7 @@ impl IsochroneCalculator {
         let headings: Vec<f64> = (0..self.config.num_directions)
             .map(|i| i as f64 * self.config.direction_step_degrees())
             .collect();
-        let env = self.resolve_env(self.config.start);
+        let env = self.resolve_env(self.config.start, 0.0);
 
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
@@ -186,7 +186,7 @@ impl IsochroneCalculator {
         isochrones
     }
 
-    fn resolve_env(&self, at: Point) -> EnvSnapshot {
+    fn resolve_env(&self, at: Point, sim_time: f64) -> EnvSnapshot {
         if self.grib_provider.is_time_invariant() {
             let (wind, current, _) = self
                 .grib_provider
@@ -196,9 +196,11 @@ impl IsochroneCalculator {
                 current: current.unwrap_or(Current::new(90.0, 0.5)),
             }
         } else {
+            let t = self.start_time + Duration::seconds(sim_time as i64);
+            let (wind, current, _) = self.grib_provider.get_environment(&at, t);
             EnvSnapshot {
-                wind: Wind::new(270.0, 10.0),
-                current: Current::new(90.0, 0.5),
+                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current: current.unwrap_or(Current::new(90.0, 0.5)),
             }
         }
     }
@@ -207,12 +209,7 @@ impl IsochroneCalculator {
         if self.grib_provider.is_time_invariant() {
             cached
         } else {
-            let t = self.start_time + Duration::seconds(time as i64);
-            let (wind, current, _) = self.grib_provider.get_environment(&point, t);
-            EnvSnapshot {
-                wind: wind.unwrap_or(cached.wind),
-                current: current.unwrap_or(cached.current),
-            }
+            self.resolve_env(point, time)
         }
     }
 
