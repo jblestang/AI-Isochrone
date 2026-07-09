@@ -6,12 +6,24 @@ use rayon::prelude::*;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const WIDTH: u32 = 1600;
-const HEIGHT: u32 = 1200;
+const DEFAULT_WIDTH: u32 = 3200;
+const DEFAULT_HEIGHT: u32 = 2400;
+const BASE_HEIGHT: f32 = 1200.0;
 const ISOCHRONE_STEP_HOURS: f64 = 12.0;
 const DEFAULT_WEATHER_SEED: u64 = 42;
-const TITLE_BAR_H: u32 = 64;
 const ROUTE_WIND_STEP_HOURS: f64 = 12.0;
+
+fn ui_scale(height: u32) -> f32 {
+    height as f32 / BASE_HEIGHT
+}
+
+fn ui_px(height: u32, px: f32) -> i32 {
+    (px * ui_scale(height)).round() as i32
+}
+
+fn ui_px_u(height: u32, px: f32) -> u32 {
+    (px * ui_scale(height)).round() as u32
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "route-snapshot", about = "Render a routed passage map PNG")]
@@ -28,6 +40,10 @@ struct Args {
     time_limit_hours: f64,
     #[arg(long, env = "AI_ISOCHRONE_SNAPSHOT")]
     output: Option<PathBuf>,
+    #[arg(long, env = "AI_ISOCHRONE_SNAPSHOT_WIDTH", default_value_t = DEFAULT_WIDTH)]
+    width: u32,
+    #[arg(long, env = "AI_ISOCHRONE_SNAPSHOT_HEIGHT", default_value_t = DEFAULT_HEIGHT)]
+    height: u32,
 }
 
 fn weather_seed() -> u64 {
@@ -93,6 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start,
         dest,
         &endpoints.label(),
+        args.width,
+        args.height,
         &out_path,
     )?;
 
@@ -123,10 +141,12 @@ struct Viewport {
     max_lat: f64,
     min_lon: f64,
     max_lon: f64,
+    width: u32,
+    height: u32,
 }
 
 impl Viewport {
-    fn from_points(points: &[Point], padding_deg: f64) -> Self {
+    fn from_points(points: &[Point], padding_deg: f64, width: u32, height: u32) -> Self {
         let mut min_lat = points[0].lat;
         let mut max_lat = points[0].lat;
         let mut min_lon = points[0].lon;
@@ -142,20 +162,24 @@ impl Viewport {
             max_lat: max_lat + padding_deg,
             min_lon: min_lon - padding_deg,
             max_lon: max_lon + padding_deg,
+            width,
+            height,
         }
     }
 
     fn project(&self, point: &Point) -> (i32, i32) {
-        let x = ((point.lon - self.min_lon) / (self.max_lon - self.min_lon)) * (WIDTH - 1) as f64;
-        let y = ((self.max_lat - point.lat) / (self.max_lat - self.min_lat)) * (HEIGHT - 1) as f64;
+        let x =
+            ((point.lon - self.min_lon) / (self.max_lon - self.min_lon)) * (self.width - 1) as f64;
+        let y =
+            ((self.max_lat - point.lat) / (self.max_lat - self.min_lat)) * (self.height - 1) as f64;
         (x.round() as i32, y.round() as i32)
     }
 
     fn unproject(&self, x: u32, y: u32) -> Point {
         let lon = self.min_lon
-            + (x as f64 / (WIDTH - 1) as f64) * (self.max_lon - self.min_lon);
+            + (x as f64 / (self.width - 1) as f64) * (self.max_lon - self.min_lon);
         let lat = self.max_lat
-            - (y as f64 / (HEIGHT - 1) as f64) * (self.max_lat - self.min_lat);
+            - (y as f64 / (self.height - 1) as f64) * (self.max_lat - self.min_lat);
         Point::new(lat, lon)
     }
 }
@@ -169,6 +193,8 @@ fn render_snapshot(
     start: Point,
     dest: Point,
     route_label: &str,
+    width: u32,
+    height: u32,
     path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut points = vec![start, dest];
@@ -182,16 +208,16 @@ fn render_snapshot(
         points.extend(route.iter().copied());
     }
 
-    let vp = Viewport::from_points(&points, 1.5);
+    let vp = Viewport::from_points(&points, 1.5, width, height);
     let sea = Rgba([20, 60, 110, 255]);
     let land = Rgba([180, 190, 150, 255]);
-    let mut img: RgbaImage = ImageBuffer::from_pixel(WIDTH, HEIGHT, sea);
+    let mut img: RgbaImage = ImageBuffer::from_pixel(width, height, sea);
 
-    let land_rows: Vec<(u32, u32)> = (0..HEIGHT)
+    let land_rows: Vec<(u32, u32)> = (0..height)
         .into_par_iter()
         .flat_map(|y| {
             let vp = vp;
-            (0..WIDTH)
+            (0..width)
                 .filter_map(move |x| {
                     let p = vp.unproject(x, y);
                     landmask.is_land(&p).then_some((x, y))
@@ -202,6 +228,9 @@ fn render_snapshot(
     for (x, y) in land_rows {
         img.put_pixel(x, y, land);
     }
+
+    let dot_r = ui_px(height, 2.0);
+    let route_w = ui_px(height, 3.0).max(1);
 
     // Isochrone rings (12 h steps)
     if !result.isochrones.is_empty() {
@@ -217,7 +246,7 @@ fn render_snapshot(
             let color = iso_colors[idx % iso_colors.len()];
             for pt in &iso.points {
                 let (x, y) = vp.project(pt);
-                draw_dot(&mut img, x, y, 2, color);
+                draw_dot(&mut img, x, y, dot_r, color);
             }
             if let Some(label_pt) = iso
                 .points
@@ -226,14 +255,20 @@ fn render_snapshot(
             {
                 let (lx, ly) = vp.project(label_pt);
                 let label = format!("{:.0}h", iso.time_hours);
-                draw_text(&mut img, lx + 6, ly - 4, &label, Rgba([255, 255, 255, 255]));
+                draw_text(
+                    &mut img,
+                    lx + ui_px(height, 6.0),
+                    ly - ui_px(height, 4.0),
+                    &label,
+                    Rgba([255, 255, 255, 255]),
+                );
             }
         }
     }
 
     // Optimal route — color by active sail configuration
     if !result.route_legs.is_empty() {
-        draw_route_by_sail(&mut img, &vp, &result.route_legs);
+        draw_route_by_sail(&mut img, &vp, &result.route_legs, route_w);
     } else if let Some(route) = &result.best_route {
         let fallback = Rgba([200, 200, 200, 255]);
         for w in route.windows(2) {
@@ -260,11 +295,29 @@ fn render_snapshot(
     }
 
     // Start / destination markers
-    draw_marker(&mut img, vp.project(&start), Rgba([50, 255, 100, 255]), 8);
-    draw_marker(&mut img, vp.project(&dest), Rgba([255, 50, 50, 255]), 10);
+    draw_marker(
+        &mut img,
+        vp.project(&start),
+        Rgba([50, 255, 100, 255]),
+        ui_px(height, 8.0),
+    );
+    draw_marker(
+        &mut img,
+        vp.project(&dest),
+        Rgba([255, 50, 50, 255]),
+        ui_px(height, 10.0),
+    );
 
     // Title bar + legend
-    fill_rect(&mut img, 0, 0, WIDTH, TITLE_BAR_H, Rgba([15, 25, 40, 230]));
+    let title_bar_h = ui_px_u(height, 64.0);
+    fill_rect(
+        &mut img,
+        0,
+        0,
+        width,
+        title_bar_h,
+        Rgba([15, 25, 40, 230]),
+    );
     draw_label_bar(&mut img, result, grib, start_time, seed, start, route_label);
 
     img.save(path)?;
@@ -276,7 +329,7 @@ fn sail_rgba(index: Option<usize>) -> Rgba<u8> {
     Rgba([r, g, b, 255])
 }
 
-fn draw_route_by_sail(img: &mut RgbaImage, vp: &Viewport, legs: &[RouteLeg]) {
+fn draw_route_by_sail(img: &mut RgbaImage, vp: &Viewport, legs: &[RouteLeg], line_w: i32) {
     for leg in legs {
         let color = sail_rgba(leg.active_sail_index);
         draw_thick_line(
@@ -284,21 +337,29 @@ fn draw_route_by_sail(img: &mut RgbaImage, vp: &Viewport, legs: &[RouteLeg]) {
             vp.project(&leg.from),
             vp.project(&leg.to),
             color,
-            3,
+            line_w,
         );
     }
 }
 
 fn draw_sail_legend_bar(img: &mut RgbaImage, polar: &MultiSailPolar) {
-    let mut x = WIDTH as i32 - 220;
-    let mut y = HEIGHT as i32 - 88;
+    let h = img.height();
+    let mut x = img.width() as i32 - ui_px(h, 220.0);
+    let mut y = h as i32 - ui_px(h, 88.0);
     draw_text(img, x, y, "Route by sail", Rgba([200, 210, 230, 255]));
-    y += 16;
+    y += ui_px(h, 16.0);
     for (i, sail) in polar.sails().iter().enumerate() {
         let c = sail_rgba(Some(i));
-        fill_rect(img, (x - 4) as u32, y as u32, 18, 4, c);
-        draw_text(img, x + 20, y - 4, sail.name, c);
-        y += 14;
+        fill_rect(
+            img,
+            (x - ui_px(h, 4.0)) as u32,
+            y as u32,
+            ui_px_u(h, 18.0),
+            ui_px_u(h, 4.0),
+            c,
+        );
+        draw_text(img, x + ui_px(h, 20.0), y - ui_px(h, 4.0), sail.name, c);
+        y += ui_px(h, 14.0);
     }
 }
 
@@ -340,8 +401,8 @@ fn draw_route_wind(
         }
         let color = wind_color_for_time(sim_hours, eta_hours);
         let (mut x, mut y) = vp.project(&point);
-        x += 14;
-        y -= 10;
+        x += ui_px(img.height(), 14.0);
+        y -= ui_px(img.height(), 10.0);
         draw_wind_from_arrow(img, x, y, &wind, color);
         draw_boat_heading_arrow(img, x, y, heading, sail_rgba(sail_idx));
         let label = if (twa - cog_twa).abs() > 8.0 {
@@ -354,8 +415,8 @@ fn draw_route_wind(
         };
         draw_text(
             img,
-            x + 16,
-            y - 6,
+            x + ui_px(img.height(), 16.0),
+            y - ui_px(img.height(), 6.0),
             &label,
             Rgba([255, 255, 255, 255]),
         );
@@ -547,7 +608,10 @@ fn wind_color_for_time(sim_hours: f64, eta_hours: f64) -> Rgba<u8> {
 /// Wind barb: arrow from upwind (where wind comes FROM) toward the sample point.
 fn draw_wind_from_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
     let from_deg = wind.direction.rem_euclid(360.0);
-    let len = (wind.speed * 3.0).clamp(18.0, 42.0) as i32;
+    let len = ui_px(
+        img.height(),
+        (wind.speed * 3.0).clamp(18.0, 42.0) as f32,
+    );
     let rad = from_deg.to_radians();
     let tx = cx + (rad.sin() * len as f64).round() as i32;
     let ty = cy - (rad.cos() * len as f64).round() as i32;
@@ -556,7 +620,7 @@ fn draw_wind_from_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, colo
 
 /// Short white arrow showing boat heading (cap).
 fn draw_boat_heading_arrow(img: &mut RgbaImage, cx: i32, cy: i32, heading_deg: f64, color: Rgba<u8>) {
-    let len = 16i32;
+    let len = ui_px(img.height(), 16.0);
     let rad = heading_deg.to_radians();
     let ex = cx + (rad.sin() * len as f64).round() as i32;
     let ey = cy - (rad.cos() * len as f64).round() as i32;
@@ -564,6 +628,7 @@ fn draw_boat_heading_arrow(img: &mut RgbaImage, cx: i32, cy: i32, heading_deg: f
 }
 
 fn draw_arrow_line(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
+    let h = img.height();
     let outline = Rgba([8, 25, 55, 255]);
     let head = Rgba([
         color[0].saturating_add(40),
@@ -571,23 +636,34 @@ fn draw_arrow_line(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, colo
         color[2],
         255,
     ]);
+    let outline_w = ui_px(h, 2.0).max(1);
+    let head_len = ui_px(h, 8.0);
     for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-        draw_thick_line(img, (x0 + dx, y0 + dy), (x1 + dx, y1 + dy), outline, 2);
+        draw_thick_line(
+            img,
+            (x0 + dx, y0 + dy),
+            (x1 + dx, y1 + dy),
+            outline,
+            outline_w,
+        );
     }
-    draw_thick_line(img, (x0, y0), (x1, y1), color, 2);
+    draw_thick_line(img, (x0, y0), (x1, y1), color, outline_w);
     let dir = ((x1 - x0) as f64).atan2((y0 - y1) as f64).to_degrees();
     for sign in [-1.0_f64, 1.0] {
         let hr = (dir + 180.0 + sign * 24.0).to_radians();
-        let hx = x1 + (hr.sin() * 8.0).round() as i32;
-        let hy = y1 - (hr.cos() * 8.0).round() as i32;
-        draw_thick_line(img, (x1, y1), (hx, hy), head, 2);
+        let hx = x1 + (hr.sin() * head_len as f64).round() as i32;
+        let hy = y1 - (hr.cos() * head_len as f64).round() as i32;
+        draw_thick_line(img, (x1, y1), (hx, hy), head, outline_w);
     }
 }
 
 /// Draw arrow pointing where wind blows (meteorological FROM → TO = dir + 180°).
 fn draw_wind_arrow(img: &mut RgbaImage, cx: i32, cy: i32, wind: &Wind, color: Rgba<u8>) {
     let to_deg = (wind.direction + 180.0).rem_euclid(360.0);
-    let len = (wind.speed * 3.0).clamp(18.0, 42.0) as i32;
+    let len = ui_px(
+        img.height(),
+        (wind.speed * 3.0).clamp(18.0, 42.0) as f32,
+    );
     let rad = to_deg.to_radians();
     let ex = cx + (rad.sin() * len as f64).round() as i32;
     let ey = cy - (rad.cos() * len as f64).round() as i32;
@@ -635,39 +711,49 @@ fn draw_label_bar(
         seed
     );
 
-    draw_text(img, 16, 8, "AI Isochrone Routing", Rgba([240, 240, 255, 255]));
-    draw_text(img, 16, 24, &subtitle, Rgba([180, 200, 230, 255]));
-    draw_text(img, 16, 42, &wind_line, Rgba([150, 220, 255, 255]));
+    draw_text(img, ui_px(img.height(), 16.0), ui_px(img.height(), 8.0), "AI Isochrone Routing", Rgba([240, 240, 255, 255]));
+    draw_text(img, ui_px(img.height(), 16.0), ui_px(img.height(), 24.0), &subtitle, Rgba([180, 200, 230, 255]));
+    draw_text(img, ui_px(img.height(), 16.0), ui_px(img.height(), 42.0), &wind_line, Rgba([150, 220, 255, 255]));
+    let grad_x = img.width() as i32 - ui_px(img.height(), 280.0);
     draw_text(
         img,
-        WIDTH as i32 - 280,
-        42,
+        grad_x,
+        ui_px(img.height(), 42.0),
         "arrow color 0h -> ETA",
         Rgba([150, 220, 255, 255]),
     );
     // Mini legend gradient
-    for i in 0..120 {
-        let c = wind_color_for_time(i as f64 / 119.0 * result.best_eta_hours.unwrap_or(180.0), result.best_eta_hours.unwrap_or(180.0));
-        fill_rect(img, (WIDTH - 280 + i) as u32, 52, 1, 6, c);
+    let grad_w = ui_px_u(img.height(), 120.0);
+    let grad_h = ui_px_u(img.height(), 6.0);
+    for i in 0..grad_w {
+        let c = wind_color_for_time(
+            i as f64 / (grad_w - 1).max(1) as f64 * result.best_eta_hours.unwrap_or(180.0),
+            result.best_eta_hours.unwrap_or(180.0),
+        );
+        fill_rect(img, (grad_x + i as i32) as u32, ui_px_u(img.height(), 52.0), 1, grad_h, c);
     }
 }
 
 fn draw_text(img: &mut RgbaImage, mut x: i32, y: i32, text: &str, color: Rgba<u8>) {
+    let block = ui_px(img.height(), 1.0).max(1);
+    let char_w = ui_px(img.height(), 8.0);
     for ch in text.chars() {
-        draw_char(img, x, y, ch, color);
-        x += 8;
+        draw_char(img, x, y, ch, color, block);
+        x += char_w;
     }
 }
 
-fn draw_char(img: &mut RgbaImage, x: i32, y: i32, ch: char, color: Rgba<u8>) {
+fn draw_char(img: &mut RgbaImage, x: i32, y: i32, ch: char, color: Rgba<u8>, block: i32) {
     let glyph = glyph_5x7(ch);
     for (row, bits) in glyph.iter().enumerate() {
         for col in 0..5 {
             if (bits >> (4 - col)) & 1 == 1 {
-                let px = x + col as i32;
-                let py = y + row as i32;
-                if px >= 0 && py >= 0 && (px as u32) < WIDTH && (py as u32) < HEIGHT {
-                    img.put_pixel(px as u32, py as u32, color);
+                for dy in 0..block {
+                    for dx in 0..block {
+                        let px = x + col as i32 * block + dx;
+                        let py = y + row as i32 * block + dy;
+                        put_pixel_opaque(img, px, py, color);
+                    }
                 }
             }
         }
@@ -736,8 +822,10 @@ fn digit_glyph(ch: char) -> [u8; 7] {
 }
 
 fn fill_rect(img: &mut RgbaImage, x0: u32, y0: u32, w: u32, h: u32, color: Rgba<u8>) {
-    for y in y0..y0.saturating_add(h).min(HEIGHT) {
-        for x in x0..x0.saturating_add(w).min(WIDTH) {
+    let max_w = img.width();
+    let max_h = img.height();
+    for y in y0..y0.saturating_add(h).min(max_h) {
+        for x in x0..x0.saturating_add(w).min(max_w) {
             img.put_pixel(x, y, color);
         }
     }
@@ -749,7 +837,7 @@ fn draw_dot(img: &mut RgbaImage, cx: i32, cy: i32, r: i32, color: Rgba<u8>) {
             if dx * dx + dy * dy <= r * r {
                 let x = cx + dx;
                 let y = cy + dy;
-                if x >= 0 && y >= 0 && (x as u32) < WIDTH && (y as u32) < HEIGHT {
+                if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
                     blend_pixel(img, x as u32, y as u32, color);
                 }
             }
@@ -759,7 +847,7 @@ fn draw_dot(img: &mut RgbaImage, cx: i32, cy: i32, r: i32, color: Rgba<u8>) {
 
 fn draw_marker(img: &mut RgbaImage, (cx, cy): (i32, i32), color: Rgba<u8>, r: i32) {
     draw_dot(img, cx, cy, r, color);
-    draw_dot(img, cx, cy, r + 2, Rgba([255, 255, 255, 255]));
+    draw_dot(img, cx, cy, r + ui_px(img.height(), 2.0), Rgba([255, 255, 255, 255]));
     draw_dot(img, cx, cy, r, color);
 }
 
@@ -787,7 +875,7 @@ fn draw_thick_line(
             for s in -half_width..=half_width {
                 let px = x + s;
                 let py = y + t;
-                if px >= 0 && py >= 0 && (px as u32) < WIDTH && (py as u32) < HEIGHT {
+                if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
                     put_pixel_opaque(img, px, py, color);
                 }
             }
@@ -808,7 +896,7 @@ fn draw_thick_line(
 }
 
 fn put_pixel_opaque(img: &mut RgbaImage, x: i32, y: i32, color: Rgba<u8>) {
-    if x >= 0 && y >= 0 && (x as u32) < WIDTH && (y as u32) < HEIGHT {
+    if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
         img.put_pixel(x as u32, y as u32, color);
     }
 }
