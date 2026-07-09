@@ -12,16 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Point::new(47.55, -3.48);
     let dest = Point::new(43.12, 5.93);
 
-    let config = SotaRoutingConfig {
-        base: IsochroneConfig {
-            start,
-            destination: Some(dest),
-            time_limit_hours: 200.0,
-            ..Default::default()
-        },
-        enable_destination_prune: true,
+    let config = SotaRoutingConfig::route_only(IsochroneConfig {
+        start,
+        destination: Some(dest),
+        time_limit_hours: 200.0,
         ..Default::default()
-    };
+    });
 
     println!("Computing Lorient → Toulon route...");
     let t0 = Instant::now();
@@ -118,6 +114,9 @@ fn render_snapshot(
             points.extend(iso.points.iter().copied());
         }
     }
+    if let Some(route) = &result.best_route {
+        points.extend(route.iter().copied());
+    }
 
     let vp = Viewport::from_points(&points, 1.5);
     let sea = Rgba([20, 60, 110, 255]);
@@ -140,22 +139,31 @@ fn render_snapshot(
         img.put_pixel(x, y, land);
     }
 
-    // Isochrone rings (every 20 h)
-    let iso_colors = [
-        Rgba([255, 80, 80, 180]),
-        Rgba([255, 160, 60, 180]),
-        Rgba([255, 230, 80, 180]),
-        Rgba([120, 220, 80, 180]),
-        Rgba([80, 180, 255, 180]),
-    ];
-    for (idx, iso) in result.isochrones.iter().enumerate() {
-        if (iso.time_hours as u32) % 20 != 0 && iso.time_hours != result.isochrones.last().map(|i| i.time_hours).unwrap_or(0.0) {
-            continue;
-        }
-        let color = iso_colors[idx % iso_colors.len()];
-        for pt in &iso.points {
-            let (x, y) = vp.project(pt);
-            draw_dot(&mut img, x, y, 2, color);
+    // Isochrone rings (when computed)
+    if !result.isochrones.is_empty() {
+        let iso_colors = [
+            Rgba([255, 80, 80, 180]),
+            Rgba([255, 160, 60, 180]),
+            Rgba([255, 230, 80, 180]),
+            Rgba([120, 220, 80, 180]),
+            Rgba([80, 180, 255, 180]),
+        ];
+        for (idx, iso) in result.isochrones.iter().enumerate() {
+            if (iso.time_hours as u32) % 20 != 0
+                && iso.time_hours
+                    != result
+                        .isochrones
+                        .last()
+                        .map(|i| i.time_hours)
+                        .unwrap_or(0.0)
+            {
+                continue;
+            }
+            let color = iso_colors[idx % iso_colors.len()];
+            for pt in &iso.points {
+                let (x, y) = vp.project(pt);
+                draw_dot(&mut img, x, y, 2, color);
+            }
         }
     }
 

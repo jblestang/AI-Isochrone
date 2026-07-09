@@ -303,6 +303,26 @@ pub struct SotaRoutingConfig {
     /// Prune nodes whose optimistic ETA exceeds best known + slack (hours)
     pub destination_prune_slack_hours: f64,
     pub enable_destination_prune: bool,
+    /// Build hourly isochrone envelopes (disable for route-only speed)
+    pub build_isochrones: bool,
+    /// Build arrival-time envelopes around destination
+    pub build_arrival_envelopes: bool,
+    /// Stop wavefront once destination is reached
+    pub stop_on_arrival: bool,
+}
+
+impl SotaRoutingConfig {
+    /// Fast destination routing: skip isochrone/envelope output, stop at arrival.
+    pub fn route_only(base: IsochroneConfig) -> Self {
+        Self {
+            base,
+            build_isochrones: false,
+            build_arrival_envelopes: false,
+            stop_on_arrival: true,
+            optimize_cost: false,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for SotaRoutingConfig {
@@ -315,6 +335,9 @@ impl Default for SotaRoutingConfig {
             constraints: RoutingConstraints::default(),
             destination_prune_slack_hours: 4.0,
             enable_destination_prune: true,
+            build_isochrones: true,
+            build_arrival_envelopes: true,
+            stop_on_arrival: false,
         }
     }
 }

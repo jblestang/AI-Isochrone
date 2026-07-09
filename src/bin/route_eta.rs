@@ -10,16 +10,12 @@ fn main() {
     println!("Lorient (south of Groix) → Toulon");
     println!("Direct rhumb: {:.0} nm\n", direct_nm);
 
-    let config = SotaRoutingConfig {
-        base: IsochroneConfig {
-            start,
-            destination: Some(dest),
-            time_limit_hours: 200.0,
-            ..Default::default()
-        },
-        enable_destination_prune: true,
+    let config = SotaRoutingConfig::route_only(IsochroneConfig {
+        start,
+        destination: Some(dest),
+        time_limit_hours: 200.0,
         ..Default::default()
-    };
+    });
 
     let time_limit_hours = config.base.time_limit_hours;
     let t0 = Instant::now();

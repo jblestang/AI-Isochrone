@@ -12,7 +12,26 @@ use crate::types::*;
 use chrono::{DateTime, Duration, Utc};
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+
+/// Cached environment for time-invariant GRIB providers.
+#[derive(Clone, Copy)]
+struct EnvSnapshot {
+    wind: Wind,
+    current: Current,
+    sea_state: SeaState,
+}
+
+/// Result of expanding one wavefront node (parallel layer step).
+struct LayerExpansion {
+    key: NodeKey,
+    point: Point,
+    heading: f64,
+    time: f64,
+    parent_key: Option<NodeKey>,
+    successors: Vec<SotaNode>,
+    arrival: Option<(NodeKey, f64, f64)>,
+}
 
 /// SOTA multi-criteria isochrone router
 pub struct SotaIsochroneRouter {
@@ -35,7 +54,6 @@ struct SotaNode {
     time: f64,
     heading: f64,
     cost: CostComponents,
-    weighted_cost: f64,
     parent_key: Option<NodeKey>,
 }
 
@@ -62,6 +80,7 @@ impl Ord for SotaNode {
 }
 
 impl SotaNode {
+    #[allow(dead_code)]
     fn register_arrival(
         &self,
         key: NodeKey,
@@ -120,20 +139,26 @@ impl SotaIsochroneRouter {
         let step_seconds = base.simulation_step_seconds();
         let step_hours = step_seconds / 3600.0;
         let time_limit = base.time_limit_hours * 3600.0;
+        let track_cost = self.config.optimize_cost;
+        let build_isos = self.config.build_isochrones;
 
-        let grid_spec = resolve_grid_spec(
-            self.grib.as_ref(),
-            base.start,
-            base.destination,
-            base.grid_step_deg,
-        );
-        let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
-        let mut tracker = GridBestTracker::new(routing_grid);
+        let mut tracker = if build_isos {
+            let grid_spec = resolve_grid_spec(
+                self.grib.as_ref(),
+                base.start,
+                base.destination,
+                base.grid_step_deg,
+            );
+            let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
+            Some(GridBestTracker::new(routing_grid))
+        } else {
+            None
+        };
 
-        let mut visited: HashMap<NodeKey, f64> = HashMap::new();
-        let mut parent_map: HashMap<NodeKey, NodeKey> = HashMap::new();
-        let mut point_map: HashMap<NodeKey, Point> = HashMap::new();
-        let mut heading_map: HashMap<NodeKey, f64> = HashMap::new();
+        let mut visited: FxHashMap<NodeKey, f64> = FxHashMap::default();
+        let mut parent_map: FxHashMap<NodeKey, NodeKey> = FxHashMap::default();
+        let mut point_map: FxHashMap<NodeKey, Point> = FxHashMap::default();
+        let mut heading_map: FxHashMap<NodeKey, f64> = FxHashMap::default();
 
         let start_key = self.point_key(&base.start);
         let start_node = SotaNode {
@@ -141,13 +166,14 @@ impl SotaIsochroneRouter {
             time: 0.0,
             heading: 0.0,
             cost: CostComponents::default(),
-            weighted_cost: 0.0,
             parent_key: None,
         };
         let mut layer = vec![start_node];
         visited.insert(start_key, 0.0);
         point_map.insert(start_key, base.start);
-        let _ = tracker.try_update(base.start, 0.0, &self.landmask);
+        if let Some(t) = tracker.as_mut() {
+            let _ = t.try_update(base.start, 0.0, &self.landmask);
+        }
 
         let mut isochrones: Vec<Isochrone> = Vec::new();
         let mut next_iso_time = base.isochrone_step_hours * 3600.0;
@@ -162,67 +188,59 @@ impl SotaIsochroneRouter {
         let iso_band = base.isochrone_step_hours * 3600.0;
         let mut current_time = 0.0;
 
+        let headings: Vec<f64> = (0..base.num_directions)
+            .map(|i| i as f64 * base.direction_step_degrees())
+            .collect();
+
+        let env = self.resolve_env(base.start);
+
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
             if nodes_explored > max_nodes {
                 break;
             }
 
-            let mut next_layer: Vec<SotaNode> = Vec::new();
+            let prune_before = best_arrival_time;
+            let expansions: Vec<LayerExpansion> = layer
+                .par_iter()
+                .filter_map(|node| {
+                    self.expand_layer_node(
+                        node,
+                        &headings,
+                        step_seconds,
+                        time_limit,
+                        dest,
+                        &env,
+                        track_cost,
+                        prune_before,
+                    )
+                })
+                .collect();
 
-            for node in layer {
-                let key = self.point_key(&node.point);
+            let mut next_layer: Vec<SotaNode> =
+                Vec::with_capacity(expansions.len().saturating_mul(6));
 
-                if node.time > time_limit {
-                    continue;
-                }
-
-                if self.config.enable_destination_prune {
-                    if let Some(dest_pt) = dest {
-                        let optimistic = optimistic_eta_hours(
-                            &node.point,
-                            &dest_pt,
-                            self.max_boat_speed_ms,
-                        );
-                        if node.time / 3600.0 + optimistic
-                            > best_arrival_time / 3600.0
-                                + self.config.destination_prune_slack_hours
-                        {
-                            continue;
-                        }
+            for exp in expansions {
+                if let Some(t) = tracker.as_mut() {
+                    if exp.time > 0.0 {
+                        t.try_update(exp.point, exp.time, &self.landmask);
                     }
                 }
 
-                if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
-                    continue;
+                point_map.insert(exp.key, exp.point);
+                heading_map.insert(exp.key, exp.heading);
+                if let Some(pk) = exp.parent_key {
+                    parent_map.insert(exp.key, pk);
                 }
 
-                if node.time > 0.0 {
-                    tracker.try_update(node.point, node.time, &self.landmask);
-                }
-
-                point_map.insert(key, node.point);
-                heading_map.insert(key, node.heading);
-                if let Some(pk) = node.parent_key {
-                    parent_map.insert(key, pk);
-                }
-
-                node.register_arrival(
-                    key,
-                    dest,
-                    self.config.arrival_radius_m,
-                    &self.weights,
-                    &mut arrival_records,
-                    &mut best_arrival_time,
-                );
-
-                for succ in self.expand(&node) {
-                    if succ.time > time_limit {
-                        continue;
+                if let Some(record) = exp.arrival {
+                    arrival_records.push(record);
+                    if record.1 < best_arrival_time {
+                        best_arrival_time = record.1;
                     }
-                    if succ.time > 0.0 && !self.landmask.is_sea(&succ.point) {
-                        continue;
-                    }
+                }
+
+                for succ in exp.successors {
                     let skey = self.point_key(&succ.point);
                     if succ.time + 1e-6
                         >= visited.get(&skey).copied().unwrap_or(f64::INFINITY)
@@ -232,43 +250,55 @@ impl SotaIsochroneRouter {
                     visited.insert(skey, succ.time);
                     point_map.insert(skey, succ.point);
                     heading_map.insert(skey, succ.heading);
-                    parent_map.insert(skey, key);
+                    parent_map.insert(skey, exp.key);
                     next_layer.push(SotaNode {
-                        parent_key: Some(key),
+                        parent_key: Some(exp.key),
                         ..succ
                     });
                 }
             }
 
-            while next_iso_time <= current_time + step_seconds + 1e-6 {
-                let iso = tracker.build_isochrone_envelope(
-                    next_iso_time,
-                    iso_band,
-                    base.start,
-                    base.envelope_sector_deg,
-                );
-                if !iso.points.is_empty() {
-                    isochrones.push(iso);
+            if build_isos {
+                while next_iso_time <= current_time + step_seconds + 1e-6 {
+                    if let Some(t) = tracker.as_ref() {
+                        let iso = t.build_isochrone_envelope(
+                            next_iso_time,
+                            iso_band,
+                            base.start,
+                            base.envelope_sector_deg,
+                        );
+                        if !iso.points.is_empty() {
+                            isochrones.push(iso);
+                        }
+                    }
+                    next_iso_time += base.isochrone_step_hours * 3600.0;
+                    if next_iso_time > time_limit + iso_band {
+                        break;
+                    }
                 }
-                next_iso_time += base.isochrone_step_hours * 3600.0;
-                if next_iso_time > time_limit + iso_band {
-                    break;
-                }
+            }
+
+            if self.config.stop_on_arrival && best_arrival_time.is_finite() {
+                break;
             }
 
             layer = next_layer;
             current_time += step_seconds;
         }
 
-        if next_iso_time <= time_limit + iso_band {
-            let iso = tracker.build_isochrone_envelope(
-                next_iso_time,
-                iso_band,
-                base.start,
-                base.envelope_sector_deg,
-            );
-            if !iso.points.is_empty() {
-                isochrones.push(iso);
+        if build_isos {
+            if next_iso_time <= time_limit + iso_band {
+                if let Some(t) = tracker.as_ref() {
+                    let iso = t.build_isochrone_envelope(
+                        next_iso_time,
+                        iso_band,
+                        base.start,
+                        base.envelope_sector_deg,
+                    );
+                    if !iso.points.is_empty() {
+                        isochrones.push(iso);
+                    }
+                }
             }
         }
 
@@ -281,13 +311,17 @@ impl SotaIsochroneRouter {
             self.config.optimize_cost,
         );
 
-        let mut arrival_envelopes = if let Some(dest_pt) = dest {
-            build_arrival_envelopes(
-                &isochrones,
-                dest_pt,
-                self.config.arrival_radius_m,
-                self.config.envelope_step_minutes,
-            )
+        let mut arrival_envelopes = if self.config.build_arrival_envelopes {
+            if let Some(dest_pt) = dest {
+                build_arrival_envelopes(
+                    &isochrones,
+                    dest_pt,
+                    self.config.arrival_radius_m,
+                    self.config.envelope_step_minutes,
+                )
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -308,74 +342,198 @@ impl SotaIsochroneRouter {
         }
     }
 
-    fn expand(&self, node: &SotaNode) -> Vec<SotaNode> {
-        let base = &self.config.base;
-        let step_seconds = base.simulation_step_seconds();
-        let current_time = self.start_time + Duration::seconds(node.time as i64);
-        let direction_step = base.direction_step_degrees();
+    fn resolve_env(&self, at: Point) -> EnvSnapshot {
+        if self.grib.is_time_invariant() {
+            let (wind, current, sea_state) = self.grib.get_environment(&at, self.start_time);
+            EnvSnapshot {
+                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current: current.unwrap_or(Current::new(90.0, 0.5)),
+                sea_state: sea_state.unwrap_or(SeaState::new(1.0, 8.0, 270.0)),
+            }
+        } else {
+            EnvSnapshot {
+                wind: Wind::new(270.0, 10.0),
+                current: Current::new(90.0, 0.5),
+                sea_state: SeaState::new(1.0, 8.0, 270.0),
+            }
+        }
+    }
 
-        let (wind, current, sea_state) = self.grib.get_environment(&node.point, current_time);
-        let wind = wind.unwrap_or(Wind::new(270.0, 10.0));
-        let current = current.unwrap_or(Current::new(90.0, 0.5));
-        let sea_state = sea_state.unwrap_or(SeaState::new(1.0, 8.0, wind.direction));
+    fn env_at(&self, point: Point, time: f64, cached: EnvSnapshot) -> EnvSnapshot {
+        if self.grib.is_time_invariant() {
+            cached
+        } else {
+            let t = self.start_time + Duration::seconds(time as i64);
+            let (wind, current, sea_state) = self.grib.get_environment(&point, t);
+            EnvSnapshot {
+                wind: wind.unwrap_or(cached.wind),
+                current: current.unwrap_or(cached.current),
+                sea_state: sea_state.unwrap_or(cached.sea_state),
+            }
+        }
+    }
 
-        if violates_constraints(&self.config.constraints, &wind, &sea_state) {
-            return Vec::new();
+    fn expand_layer_node(
+        &self,
+        node: &SotaNode,
+        headings: &[f64],
+        step_seconds: f64,
+        time_limit: f64,
+        dest: Option<Point>,
+        cached_env: &EnvSnapshot,
+        track_cost: bool,
+        best_arrival_time: f64,
+    ) -> Option<LayerExpansion> {
+        if node.time > time_limit {
+            return None;
         }
 
-        let directions: Vec<f64> = (0..base.num_directions)
-            .map(|i| i as f64 * direction_step)
+        if self.config.enable_destination_prune {
+            if let Some(dest_pt) = dest {
+                if best_arrival_time.is_finite() {
+                    let optimistic =
+                        optimistic_eta_hours(&node.point, &dest_pt, self.max_boat_speed_ms);
+                    if node.time / 3600.0 + optimistic
+                        > best_arrival_time / 3600.0 + self.config.destination_prune_slack_hours
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
+            return None;
+        }
+
+        let key = self.point_key(&node.point);
+        let env = self.env_at(node.point, node.time, *cached_env);
+
+        if violates_constraints(&self.config.constraints, &env.wind, &env.sea_state) {
+            return None;
+        }
+
+        let mut raw_successors = Vec::with_capacity(headings.len());
+        for &heading in headings {
+            if let Some(succ) = self.expand_heading(
+                node,
+                heading,
+                step_seconds,
+                time_limit,
+                &env,
+                track_cost,
+            ) {
+                raw_successors.push(succ);
+            }
+        }
+
+        if raw_successors.is_empty() {
+            let arrival = self.arrival_record(node, key, dest);
+            return Some(LayerExpansion {
+                key,
+                point: node.point,
+                heading: node.heading,
+                time: node.time,
+                parent_key: node.parent_key,
+                successors: Vec::new(),
+                arrival,
+            });
+        }
+
+        let points: Vec<Point> = raw_successors.iter().map(|s| s.point).collect();
+        let are_sea = self.landmask.are_sea(&points);
+        let successors: Vec<SotaNode> = raw_successors
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| are_sea.get(i).copied().unwrap_or(false).then_some(s))
             .collect();
 
-        let candidates: Vec<SotaNode> = directions
-            .par_iter()
-            .filter_map(|&heading| {
-                let angle = angle_au_vent(heading, wind.direction);
-                let base_speed = self.polar.speed_ms(angle, wind.speed);
-                let factor = self.sea_modifier.speed_factor(angle, &sea_state);
-                let boat_speed = base_speed * factor;
+        let arrival = self.arrival_record(node, key, dest);
 
-                if boat_speed < 0.05 {
-                    return None;
-                }
+        Some(LayerExpansion {
+            key,
+            point: node.point,
+            heading: node.heading,
+            time: node.time,
+            parent_key: node.parent_key,
+            successors,
+            arrival,
+        })
+    }
 
-                let (eff_speed, eff_dir) =
-                    calculate_effective_velocity(boat_speed, heading, &current);
-                let distance = eff_speed * step_seconds;
+    fn arrival_record(
+        &self,
+        node: &SotaNode,
+        key: NodeKey,
+        dest: Option<Point>,
+    ) -> Option<(NodeKey, f64, f64)> {
+        let dest_pt = dest?;
+        if node.point.distance_to(&dest_pt) <= self.config.arrival_radius_m {
+            Some((key, node.time, node.cost.total(&self.weights)))
+        } else {
+            None
+        }
+    }
 
-                if distance > base.max_distance_meters {
-                    return None;
-                }
+    fn expand_heading(
+        &self,
+        node: &SotaNode,
+        heading: f64,
+        step_seconds: f64,
+        time_limit: f64,
+        env: &EnvSnapshot,
+        track_cost: bool,
+    ) -> Option<SotaNode> {
+        let base = &self.config.base;
+        let angle = angle_au_vent(heading, env.wind.direction);
+        let base_speed = self.polar.speed_ms(angle, env.wind.speed);
+        let factor = self.sea_modifier.speed_factor(angle, &env.sea_state);
+        let boat_speed = base_speed * factor;
 
-                let new_point = move_from_point(&node.point, eff_dir, distance);
-                if node.time > 0.0 && !self.landmask.is_sea(&new_point) {
-                    return None;
-                }
+        if boat_speed < 0.05 {
+            return None;
+        }
 
-                let step = step_cost(
-                    step_seconds,
-                    Some(node.heading),
-                    heading,
-                    &wind,
-                    &current,
-                    &sea_state,
-                    &self.weights,
-                );
-                let new_cost = node.cost.add(&step);
-                let weighted = new_cost.total(&self.weights);
+        let (eff_speed, eff_dir) =
+            calculate_effective_velocity(boat_speed, heading, &env.current);
+        let distance = eff_speed * step_seconds;
 
-                Some(SotaNode {
-                    point: new_point,
-                    time: node.time + step_seconds,
-                    heading,
-                    cost: new_cost,
-                    weighted_cost: weighted,
-                    parent_key: None,
-                })
-            })
-            .collect();
+        if distance > base.max_distance_meters {
+            return None;
+        }
 
-        candidates
+        let new_time = node.time + step_seconds;
+        if new_time > time_limit {
+            return None;
+        }
+
+        let new_point = move_from_point(&node.point, eff_dir, distance);
+
+        let cost = if track_cost {
+            let step = step_cost(
+                step_seconds,
+                Some(node.heading),
+                heading,
+                &env.wind,
+                &env.current,
+                &env.sea_state,
+                &self.weights,
+            );
+            node.cost.add(&step)
+        } else {
+            CostComponents {
+                eta_seconds: new_time,
+                ..Default::default()
+            }
+        };
+
+        Some(SotaNode {
+            point: new_point,
+            time: new_time,
+            heading,
+            cost,
+            parent_key: None,
+        })
     }
 
     fn point_key(&self, point: &Point) -> NodeKey {
@@ -396,9 +554,9 @@ impl SotaIsochroneRouter {
     fn reconstruct_best_route(
         &self,
         arrivals: &[(NodeKey, f64, f64)],
-        parent_map: &HashMap<NodeKey, NodeKey>,
-        point_map: &HashMap<NodeKey, Point>,
-        heading_map: &HashMap<NodeKey, f64>,
+        parent_map: &FxHashMap<NodeKey, NodeKey>,
+        point_map: &FxHashMap<NodeKey, Point>,
+        heading_map: &FxHashMap<NodeKey, f64>,
         step_hours: f64,
         optimize_cost: bool,
     ) -> (Option<Vec<Point>>, Option<f64>, Option<f64>, Vec<RouteLeg>) {

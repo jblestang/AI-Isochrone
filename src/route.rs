@@ -5,12 +5,16 @@ const METERS_PER_NM: f64 = 1852.0;
 const TACK_THRESHOLD_DEG: f64 = 35.0;
 
 /// Backtrack from arrival cell key through parent map to start.
-pub fn backtrack_route(
+pub fn backtrack_route<S1, S2>(
     _start: Point,
     arrival_key: (i32, i32),
-    parent_map: &std::collections::HashMap<(i32, i32), (i32, i32)>,
-    point_map: &std::collections::HashMap<(i32, i32), Point>,
-) -> Vec<Point> {
+    parent_map: &std::collections::HashMap<(i32, i32), (i32, i32), S1>,
+    point_map: &std::collections::HashMap<(i32, i32), Point, S2>,
+) -> Vec<Point>
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
     let mut keys = vec![arrival_key];
     let mut current = arrival_key;
     let mut guard = 0usize;

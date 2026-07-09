@@ -49,6 +49,11 @@ pub trait GribProvider {
     fn get_wind_and_current(&self, point: &Point, time: DateTime<Utc>) -> (Option<Wind>, Option<Current>) {
         (self.get_wind(point, time), self.get_current(point, time))
     }
+
+    /// True when wind/current/sea do not vary with position or time.
+    fn is_time_invariant(&self) -> bool {
+        false
+    }
 }
 
 /// Provider simple qui retourne des valeurs constantes (pour tests et développement)
@@ -93,6 +98,10 @@ impl GribProvider for SimpleGribProvider {
 
     fn get_sea_state(&self, _point: &Point, _time: DateTime<Utc>) -> Option<SeaState> {
         Some(self.default_sea_state)
+    }
+
+    fn is_time_invariant(&self) -> bool {
+        true
     }
 }
 
