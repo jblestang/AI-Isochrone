@@ -155,19 +155,15 @@ mod tests {
         );
         for (i, leg) in r.route_legs.iter().enumerate().take(30) {
             let twa_boat = polar::angle_au_vent(leg.boat_heading_deg, leg.wind.direction);
-            let twa_track = polar::angle_au_vent(leg.bearing_deg, leg.wind.direction);
             let spd = SimplePolar::default_voilier().speed_ms(twa_boat, leg.wind.speed);
             assert!(
-                spd >= 0.05,
-                "leg {i} boat TWA {twa_boat} track TWA {twa_track} hdg={} wind={} -> {spd} m/s",
+                spd >= 0.05 && twa_boat + 1e-6 >= polar::MIN_ANGLE_AU_VENT_DEG,
+                "leg {i} boat TWA {twa_boat} hdg={} wind={} -> {spd} m/s",
                 leg.boat_heading_deg,
                 leg.wind.direction
             );
-            assert!(
-                twa_boat + 1e-6 >= polar::MIN_ANGLE_AU_VENT_DEG
-                    && twa_track + 1e-6 >= polar::MIN_ANGLE_AU_VENT_DEG,
-                "leg {i} no-go: boat TWA {twa_boat} track TWA {twa_track}"
-            );
         }
+        let tacks = r.route_legs.iter().filter(|l| l.is_tack).count();
+        assert!(tacks > 10, "expected tacking on Lorient-Toulon, got {tacks} tacks");
     }
 }

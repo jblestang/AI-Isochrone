@@ -4,7 +4,7 @@ use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use crate::grib::GribProvider;
 use crate::landmask::Landmask;
 use crate::objective::{step_cost, CostComponents, ObjectiveWeights};
-use crate::polar::{angle_au_vent, Polar, MIN_ANGLE_AU_VENT_DEG};
+use crate::polar::{angle_au_vent, routing_headings, Polar, MIN_ANGLE_AU_VENT_DEG};
 use crate::route::build_route_legs;
 use crate::sea_state::{DefaultSeaStateModifier, SeaStatePolarModifier};
 use crate::types::*;
@@ -305,14 +305,6 @@ impl SotaIsochroneRouter {
         let iso_band = base.isochrone_step_hours * 3600.0;
         let mut current_time = 0.0;
 
-        let headings: Vec<f64> = (0..base.num_directions)
-            .map(|i| i as f64 * base.direction_step_degrees())
-            .collect();
-
-        let env = self.resolve_env(base.start, 0.0);
-        let time_invariant = self.grib.is_time_invariant();
-        let cached_kinematics = self.build_heading_kinematics(&headings, &env);
-
         let profile_on = ProfileCounters::enabled();
         let profile = Arc::new(ProfileCounters::default());
         let mut expand_wall = Duration::ZERO;
@@ -332,14 +324,9 @@ impl SotaIsochroneRouter {
             }
 
             let prune_before = best_arrival_time;
-            let layer_kinematics;
-            let heading_kinematics: &[HeadingKinematics] = if time_invariant {
-                &cached_kinematics
-            } else {
-                layer_kinematics =
-                    self.build_heading_kinematics(&headings, &self.resolve_env(layer[0].point, current_time));
-                &layer_kinematics
-            };
+            let layer_env = self.resolve_env(layer[0].point, current_time);
+            let headings = routing_headings(base.num_directions, layer_env.wind.direction);
+            let heading_kinematics = self.build_heading_kinematics(&headings, &layer_env);
             let t_expand = Instant::now();
             let profile_ref = Arc::clone(&profile);
             let expansions: Vec<LayerExpansion> = layer
@@ -352,7 +339,7 @@ impl SotaIsochroneRouter {
                         step_seconds,
                         time_limit,
                         dest,
-                        &env,
+                        &layer_env,
                         track_cost,
                         prune_before,
                         profile_on.then_some(profile_ref.as_ref()),
@@ -737,11 +724,6 @@ impl SotaIsochroneRouter {
         }
 
         let eff_dir = eff_vx.atan2(eff_vy).to_degrees().rem_euclid(360.0);
-        let track_twa = angle_au_vent(eff_dir, env.wind.direction);
-        if track_twa + 1e-6 < MIN_ANGLE_AU_VENT_DEG {
-            return None;
-        }
-
         let new_point = crate::geometry::move_from_point_fast(&node.point, eff_dir, distance);
         let dist_from_start = node.dist_from_start + distance;
         let cell_key = point_key_from_dist(&new_point, dist_from_start);

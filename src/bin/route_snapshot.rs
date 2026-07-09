@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             destination: Some(dest),
             time_limit_hours: 200.0,
             isochrone_step_hours: ISOCHRONE_STEP_HOURS,
+            num_directions: 16,
             ..Default::default()
         },
         build_isochrones: true,

@@ -380,7 +380,7 @@ impl Default for IsochroneConfig {
             isochrone_step_hours: 1.0,
             simulation_step_minutes: 10.0,
             max_distance_meters: 50000.0, // ~50 km max par pas (27 nœuds max)
-            num_directions: 8, // 8 directions = 45° entre chaque
+            num_directions: 16, // 16 compass + tack headings each layer
             grid_step_deg: None,
             envelope_sector_deg: 10.0,
         }

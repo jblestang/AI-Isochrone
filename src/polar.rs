@@ -183,6 +183,20 @@ pub fn signed_wind_side(boat_heading: f64, wind_direction: f64) -> f64 {
     }
 }
 
+/// Compass headings plus close-hauled candidates on both tacks (for beating upwind).
+pub fn routing_headings(num_compass_dirs: usize, wind_direction: f64) -> Vec<f64> {
+    let n = num_compass_dirs.max(1);
+    let step = 360.0 / n as f64;
+    let mut headings: Vec<f64> = (0..n).map(|i| i as f64 * step).collect();
+    for twa in [MIN_ANGLE_AU_VENT_DEG, 38.0, 45.0, 52.0, 60.0] {
+        headings.push((wind_direction + twa).rem_euclid(360.0));
+        headings.push((wind_direction - twa).rem_euclid(360.0));
+    }
+    headings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    headings.dedup_by(|a, b| (*a - *b).abs() < 1.5);
+    headings
+}
+
 /// Minimum heading change to count as a manoeuvre (tack or gybe).
 pub const TACK_GYBE_MIN_HEADING_DELTA_DEG: f64 = 35.0;
 
@@ -251,5 +265,15 @@ mod tests {
     fn gybe_crosses_wind_side_downwind() {
         // North wind, gybe from SE to SW
         assert!(is_tack_or_gybe(135.0, 225.0, 0.0));
+    }
+
+    #[test]
+    fn routing_headings_cover_both_tacks() {
+        let h = routing_headings(8, 254.0);
+        assert!(h.len() >= 12);
+        assert!(h.iter().any(|&hdg| {
+            let twa = angle_au_vent(hdg, 254.0);
+            twa >= 30.0 && twa <= 45.0
+        }));
     }
 }

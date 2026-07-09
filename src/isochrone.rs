@@ -115,20 +115,20 @@ impl IsochroneCalculator {
         let mut nodes_explored = 0usize;
         let mut current_time = 0.0;
 
-        let headings: Vec<f64> = (0..self.config.num_directions)
-            .map(|i| i as f64 * self.config.direction_step_degrees())
-            .collect();
-        let env = self.resolve_env(self.config.start, 0.0);
-
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
             if nodes_explored >= max_nodes {
                 break;
             }
 
+            let layer_env = self.resolve_env(layer[0].point, current_time);
+            let headings = routing_headings(self.config.num_directions, layer_env.wind.direction);
+
             let expansions: Vec<LayerExpansion> = layer
                 .par_iter()
-                .filter_map(|node| self.expand_layer_node(node, &headings, step_seconds, time_limit, env))
+                .filter_map(|node| {
+                    self.expand_layer_node(node, &headings, step_seconds, time_limit, layer_env)
+                })
                 .collect();
 
             let mut next_layer: Vec<Node> =
@@ -314,11 +314,6 @@ impl IsochroneCalculator {
             heading,
             current,
         );
-
-        let track_twa = angle_au_vent(effective_direction, wind.direction);
-        if track_twa + 1e-6 < crate::polar::MIN_ANGLE_AU_VENT_DEG {
-            return None;
-        }
         
         // Distance parcourue en un pas de temps
         let distance = effective_speed * step_seconds;
