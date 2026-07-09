@@ -220,7 +220,7 @@ impl SotaIsochroneRouter {
             let mut next_layer: Vec<SotaNode> =
                 Vec::with_capacity(expansions.len().saturating_mul(6));
 
-            for exp in expansions {
+            for exp in &expansions {
                 if let Some(t) = tracker.as_mut() {
                     if exp.time > 0.0 {
                         t.try_update(exp.point, exp.time, &self.landmask);
@@ -239,23 +239,30 @@ impl SotaIsochroneRouter {
                         best_arrival_time = record.1;
                     }
                 }
+            }
 
-                for succ in exp.successors {
-                    let skey = self.point_key(&succ.point);
-                    if succ.time + 1e-6
-                        >= visited.get(&skey).copied().unwrap_or(f64::INFINITY)
-                    {
-                        continue;
-                    }
-                    visited.insert(skey, succ.time);
-                    point_map.insert(skey, succ.point);
-                    heading_map.insert(skey, succ.heading);
-                    parent_map.insert(skey, exp.key);
-                    next_layer.push(SotaNode {
-                        parent_key: Some(exp.key),
-                        ..succ
-                    });
+            let pending: Vec<(NodeKey, SotaNode)> = expansions
+                .par_iter()
+                .flat_map_iter(|exp| {
+                    exp.successors
+                        .iter()
+                        .map(move |succ| (exp.key, succ.clone()))
+                })
+                .collect();
+
+            for (parent_key, succ) in pending {
+                let skey = self.point_key(&succ.point);
+                if succ.time + 1e-6 >= visited.get(&skey).copied().unwrap_or(f64::INFINITY) {
+                    continue;
                 }
+                visited.insert(skey, succ.time);
+                point_map.insert(skey, succ.point);
+                heading_map.insert(skey, succ.heading);
+                parent_map.insert(skey, parent_key);
+                next_layer.push(SotaNode {
+                    parent_key: Some(parent_key),
+                    ..succ
+                });
             }
 
             if build_isos {
@@ -413,19 +420,19 @@ impl SotaIsochroneRouter {
             return None;
         }
 
-        let mut raw_successors = Vec::with_capacity(headings.len());
-        for &heading in headings {
-            if let Some(succ) = self.expand_heading(
-                node,
-                heading,
-                step_seconds,
-                time_limit,
-                &env,
-                track_cost,
-            ) {
-                raw_successors.push(succ);
-            }
-        }
+        let raw_successors: Vec<SotaNode> = headings
+            .iter()
+            .filter_map(|&heading| {
+                self.expand_heading(
+                    node,
+                    heading,
+                    step_seconds,
+                    time_limit,
+                    &env,
+                    track_cost,
+                )
+            })
+            .collect();
 
         if raw_successors.is_empty() {
             let arrival = self.arrival_record(node, key, dest);

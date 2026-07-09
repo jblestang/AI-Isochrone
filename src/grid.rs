@@ -2,6 +2,7 @@ use crate::envelope::extract_outward_envelope;
 use crate::grib::GribProvider;
 use crate::landmask::Landmask;
 use crate::types::{Isochrone, Point};
+use rayon::prelude::*;
 
 /// Regular lat/lon grid specification (typically aligned with GRIB data).
 #[derive(Debug, Clone, Copy)]
@@ -58,18 +59,20 @@ pub struct RoutingGrid {
 
 impl RoutingGrid {
     pub fn from_spec(spec: GridSpec, landmask: &Landmask) -> Self {
-        let mut sea_cells = std::collections::HashSet::new();
         let n_lat = spec.n_lat();
         let n_lon = spec.n_lon();
 
-        for i in 0..=n_lat {
-            for j in 0..=n_lon {
-                let center = Self::cell_center_with_spec(&spec, (i, j));
-                if landmask.is_sea(&center) {
-                    sea_cells.insert((i, j));
-                }
-            }
-        }
+        let sea_cells: std::collections::HashSet<CellKey> = (0..=n_lat)
+            .into_par_iter()
+            .flat_map(|i| {
+                (0..=n_lon)
+                    .filter_map(move |j| {
+                        let center = Self::cell_center_with_spec(&spec, (i, j));
+                        landmask.is_sea(&center).then_some((i, j))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         Self { spec, sea_cells }
     }

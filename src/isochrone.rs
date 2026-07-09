@@ -5,10 +5,22 @@ use crate::polar::*;
 use crate::grib::*;
 use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use chrono::{DateTime, Utc, Duration};
-use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-// Plus besoin de ConvexHull, on utilise notre propre algorithme
+use rustc_hash::FxHashMap;
+
+/// Cached wind/current for time-invariant providers.
+#[derive(Clone, Copy)]
+struct EnvSnapshot {
+    wind: Wind,
+    current: Current,
+}
+
+/// One wavefront node and its successors (parallel layer step).
+struct LayerExpansion {
+    node: Node,
+    successors: Vec<Node>,
+}
 
 /// État d'un nœud dans le graphe d'exploration
 #[derive(Debug, Clone)]
@@ -83,7 +95,7 @@ impl IsochroneCalculator {
         let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
         let mut tracker = GridBestTracker::new(routing_grid);
 
-        let mut visited: HashMap<(i32, i32), f64> = HashMap::new();
+        let mut visited: FxHashMap<(i32, i32), f64> = FxHashMap::default();
 
         let start_node = Node {
             point: self.config.start,
@@ -103,34 +115,31 @@ impl IsochroneCalculator {
         let mut nodes_explored = 0usize;
         let mut current_time = 0.0;
 
+        let headings: Vec<f64> = (0..self.config.num_directions)
+            .map(|i| i as f64 * self.config.direction_step_degrees())
+            .collect();
+        let env = self.resolve_env(self.config.start);
+
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
             if nodes_explored >= max_nodes {
                 break;
             }
 
-            let mut next_layer: Vec<Node> = Vec::new();
+            let expansions: Vec<LayerExpansion> = layer
+                .par_iter()
+                .filter_map(|node| self.expand_layer_node(node, &headings, step_seconds, time_limit, env))
+                .collect();
 
-            for node in layer {
-                if node.time > time_limit {
-                    continue;
+            let mut next_layer: Vec<Node> =
+                Vec::with_capacity(expansions.len().saturating_mul(6));
+
+            for exp in expansions {
+                if exp.node.time > 0.0 {
+                    tracker.try_update(exp.node.point, exp.node.time, &self.landmask);
                 }
 
-                if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
-                    continue;
-                }
-
-                if node.time > 0.0 {
-                    tracker.try_update(node.point, node.time, &self.landmask);
-                }
-
-                for successor in self.explore_directions(&node) {
-                    if successor.time > time_limit {
-                        continue;
-                    }
-                    if successor.time > 0.0 && !self.landmask.is_sea(&successor.point) {
-                        continue;
-                    }
+                for successor in exp.successors {
                     let skey = self.point_key(&successor.point);
                     if successor.time + 1e-6
                         >= visited.get(&skey).copied().unwrap_or(f64::INFINITY)
@@ -177,52 +186,99 @@ impl IsochroneCalculator {
         isochrones
     }
 
+    fn resolve_env(&self, at: Point) -> EnvSnapshot {
+        if self.grib_provider.is_time_invariant() {
+            let (wind, current, _) = self
+                .grib_provider
+                .get_environment(&at, self.start_time);
+            EnvSnapshot {
+                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current: current.unwrap_or(Current::new(90.0, 0.5)),
+            }
+        } else {
+            EnvSnapshot {
+                wind: Wind::new(270.0, 10.0),
+                current: Current::new(90.0, 0.5),
+            }
+        }
+    }
+
+    fn env_at(&self, point: Point, time: f64, cached: EnvSnapshot) -> EnvSnapshot {
+        if self.grib_provider.is_time_invariant() {
+            cached
+        } else {
+            let t = self.start_time + Duration::seconds(time as i64);
+            let (wind, current, _) = self.grib_provider.get_environment(&point, t);
+            EnvSnapshot {
+                wind: wind.unwrap_or(cached.wind),
+                current: current.unwrap_or(cached.current),
+            }
+        }
+    }
+
+    fn expand_layer_node(
+        &self,
+        node: &Node,
+        headings: &[f64],
+        step_seconds: f64,
+        time_limit: f64,
+        cached_env: EnvSnapshot,
+    ) -> Option<LayerExpansion> {
+        if node.time > time_limit {
+            return None;
+        }
+        if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
+            return None;
+        }
+
+        let env = self.env_at(node.point, node.time, cached_env);
+        let successors = self.explore_directions(node, headings, &env.wind, &env.current, step_seconds);
+
+        Some(LayerExpansion {
+            node: node.clone(),
+            successors,
+        })
+    }
+
     /// Explore toutes les directions possibles depuis un nœud
-    fn explore_directions(&self, node: &Node) -> Vec<Node> {
-        let step_seconds = self.config.simulation_step_seconds();
-        let current_time = self.start_time + Duration::seconds(node.time as i64);
-        
-        // Obtenir vent et courant pour ce point à ce temps
-        let (wind_opt, current_opt) = self.grib_provider.get_wind_and_current(
-            &node.point,
-            current_time,
-        );
-        
-        let wind = wind_opt.unwrap_or(Wind::new(270.0, 10.0));
-        let current = current_opt.unwrap_or(Current::new(90.0, 0.5));
-        
-        // Explorer toutes les directions possibles
-        let direction_step = self.config.direction_step_degrees();
-        let directions: Vec<f64> = (0..self.config.num_directions)
-            .map(|i| i as f64 * direction_step)
-            .collect();
-        
-        // Paralléliser l'exploration des directions (sans vérification landmask immédiate)
-        let mut candidates: Vec<Node> = directions
-            .par_iter()
+    fn explore_directions(
+        &self,
+        node: &Node,
+        headings: &[f64],
+        wind: &Wind,
+        current: &Current,
+        step_seconds: f64,
+    ) -> Vec<Node> {
+        let candidates: Vec<Node> = headings
+            .iter()
             .filter_map(|&heading| {
-                self.explore_direction_without_landmask(node, heading, &wind, &current, step_seconds)
+                self.explore_direction_without_landmask(
+                    node,
+                    heading,
+                    wind,
+                    current,
+                    step_seconds,
+                )
             })
             .collect();
-        
-        // Vérifier le landmask en batch pour tous les candidats (parallélisé)
-        if !candidates.is_empty() {
-            let candidate_points: Vec<Point> = candidates.iter().map(|n| n.point).collect();
-            let are_sea = self.landmask.are_sea(&candidate_points);
 
-            candidates = candidates
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, candidate)| {
-                    if node.time > 0.0 && !are_sea.get(idx).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    Some(candidate)
-                })
-                .collect();
+        if candidates.is_empty() {
+            return candidates;
         }
-        
+
+        let candidate_points: Vec<Point> = candidates.iter().map(|n| n.point).collect();
+        let are_sea = self.landmask.are_sea(&candidate_points);
+
         candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, candidate)| {
+                if node.time > 0.0 && !are_sea.get(idx).copied().unwrap_or(false) {
+                    return None;
+                }
+                Some(candidate)
+            })
+            .collect()
     }
 
     /// Explore une direction spécifique depuis un nœud (sans vérification landmask)

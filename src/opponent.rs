@@ -7,6 +7,7 @@ use crate::scenario::ScenarioGribProvider;
 use crate::sota_isochrone::calculate_sota_routing;
 use crate::types::*;
 use chrono::{DateTime, Duration, Utc};
+use rayon::prelude::*;
 
 fn med_grid() -> BufrGribGridProvider {
     BufrGribGridProvider::synthetic_mediterranean(43.0, 49.0, -6.0, 9.0, 0.5)
@@ -24,22 +25,24 @@ pub fn calculate_dual_routing(
 ) -> DualRoutingResult {
     let dest = config.base.destination;
 
-    let mut scenario_results = Vec::new();
-    for scenario in scenarios {
-        let grib_for_scenario: Box<dyn GribProvider + Send + Sync> =
-            Box::new(ScenarioGribProvider::new(med_grid(), scenario.clone()));
+    let scenario_results: Vec<SotaRoutingResult> = scenarios
+        .par_iter()
+        .map(|scenario| {
+            let grib_for_scenario: Box<dyn GribProvider + Send + Sync> =
+                Box::new(ScenarioGribProvider::new(med_grid(), scenario.clone()));
 
-        let mut r = calculate_sota_routing(
-            config.clone(),
-            weights.clone(),
-            landmask.clone(),
-            Box::new(SimplePolar::default_voilier()),
-            grib_for_scenario,
-            start_time,
-        );
-        r.scenario_id = Some(scenario.id.clone());
-        scenario_results.push(r);
-    }
+            let mut r = calculate_sota_routing(
+                config.clone(),
+                weights.clone(),
+                landmask.clone(),
+                Box::new(SimplePolar::default_voilier()),
+                grib_for_scenario,
+                start_time,
+            );
+            r.scenario_id = Some(scenario.id.clone());
+            r
+        })
+        .collect();
 
     let mut mine = calculate_sota_routing(
         config.clone(),
