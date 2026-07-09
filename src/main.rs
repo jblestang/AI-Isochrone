@@ -32,7 +32,7 @@ struct Args {
     isochrone_step_hours: f64,
 
     /// Pas de simulation en minutes
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 10.0)]
     simulation_step_minutes: f64,
 
     /// Nombre de directions à explorer

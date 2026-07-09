@@ -358,8 +358,8 @@ pub struct IsochroneConfig {
     pub destination: Option<Point>, // Optionnel pour isochrone simple
     pub time_limit_hours: f64,
     pub isochrone_step_hours: f64, // Intervalle entre isochrones (1h)
-    pub simulation_step_minutes: f64, // Pas de simulation (5 min)
-    pub max_distance_meters: f64, // Distance maximale pour un pas de 5 min
+    pub simulation_step_minutes: f64, // Pas de simulation (10 min)
+    pub max_distance_meters: f64, // Distance maximale pour un pas de 10 min
     pub num_directions: usize, // Nombre de directions explorées (ex: 16 pour 22.5°)
     /// Routing/isochrone grid step in degrees. When `None`, uses GRIB grid or 0.25° default.
     pub grid_step_deg: Option<f64>,
@@ -374,7 +374,7 @@ impl Default for IsochroneConfig {
             destination: Some(Point::new(43.12, 5.93)), // Toulon
             time_limit_hours: 24.0,
             isochrone_step_hours: 1.0,
-            simulation_step_minutes: 5.0,
+            simulation_step_minutes: 10.0,
             max_distance_meters: 50000.0, // ~50 km max par pas (27 nœuds max)
             num_directions: 16, // 16 directions = 22.5° entre chaque
             grid_step_deg: None,
