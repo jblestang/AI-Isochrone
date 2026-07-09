@@ -8,11 +8,11 @@ use std::time::Instant;
 #[command(about = "Calcul d'isochrones pour bateau avec GRIBS, courants et polaire")]
 struct Args {
     /// Latitude du point de départ
-    #[arg(long, default_value_t = 47.75)]
+    #[arg(long, default_value_t = 47.55)]
     start_lat: f64,
 
     /// Longitude du point de départ
-    #[arg(long, default_value_t = -3.37)]
+    #[arg(long, default_value_t = -3.48)]
     start_lon: f64,
 
     /// Latitude du point d'arrivée (optionnel)

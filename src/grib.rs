@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn synthetic_mediterranean_supports_routing_headings() {
         let grid = BufrGribGridProvider::synthetic_mediterranean(43.0, 49.0, -6.0, 9.0, 0.5);
-        let point = Point::new(47.75, -3.37);
+        let point = Point::new(47.55, -3.48);
         let (wind, _current, sea) = grid.get_environment(&point, Utc::now());
         let wind = wind.unwrap();
         let sea = sea.unwrap();

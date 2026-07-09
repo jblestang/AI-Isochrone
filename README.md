@@ -112,7 +112,7 @@ sudo apt install libssl-dev libgeos-dev python3-dev pkg-config
 
 ```bash
 cargo run --release -- \
-  --start-lat 47.75 --start-lon -3.37 \
+  --start-lat 47.55 --start-lon -3.48 \
   --dest-lat 43.12 --dest-lon 5.93 \
   --time-limit-hours 12
 ```

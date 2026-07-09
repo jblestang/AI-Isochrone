@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn test_move_from_point() {
-        let start = Point::new(47.75, -3.37);
+        let start = Point::new(47.55, -3.48);
         let end = move_from_point(&start, 90.0, 1000.0); // 1km vers l'Est
         assert!(end.lon > start.lon);
     }

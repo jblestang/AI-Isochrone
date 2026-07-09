@@ -180,7 +180,7 @@ impl Default for OpponentState {
     fn default() -> Self {
         Self {
             label: "Opponent".into(),
-            position: Point::new(47.85, -3.20),
+            position: Point::new(47.58, -3.42),
             polar_scale: 0.92,
             start_time_offset_hours: 0.0,
         }
@@ -347,7 +347,7 @@ pub struct IsochroneConfig {
 impl Default for IsochroneConfig {
     fn default() -> Self {
         Self {
-            start: Point::new(47.75, -3.37), // Lorient par défaut
+            start: Point::new(47.55, -3.48), // South of Île de Groix (open water)
             destination: Some(Point::new(43.12, 5.93)), // Toulon
             time_limit_hours: 24.0,
             isochrone_step_hours: 1.0,

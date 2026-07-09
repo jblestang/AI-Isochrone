@@ -5,9 +5,9 @@ use clap::Parser;
 #[command(name = "ai-isochrone-gui")]
 #[command(about = "SOTA isochrone routing GUI (native)")]
 struct Args {
-    #[arg(long, default_value_t = 47.75)]
+    #[arg(long, default_value_t = 47.55)]
     start_lat: f64,
-    #[arg(long, default_value_t = -3.37)]
+    #[arg(long, default_value_t = -3.48)]
     start_lon: f64,
     #[arg(long, default_value_t = 43.12)]
     dest_lat: f64,
