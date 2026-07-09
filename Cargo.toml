@@ -24,6 +24,7 @@ chrono = { version = "0.4", features = ["wasmbind"] }
 anyhow = "1.0"
 thiserror = "1.0"
 clap = { version = "4.4", features = ["derive"] }
+image = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
@@ -35,19 +36,22 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"], optional = true }
 egui = { version = "0.33", optional = true }
 egui_extras = { version = "0.33", features = ["image", "all_loaders"], optional = true }
-image = { version = "0.24", optional = true }
 poll-promise = { version = "0.3", optional = true, features = ["web"] }
 walkers = { version = "0.51", optional = true }
 
 [features]
 default = ["native-landmask"]
 native-landmask = ["roaring-landmask"]
-gui = ["eframe", "egui", "egui_extras", "image", "poll-promise", "walkers"]
+gui = ["eframe", "egui", "egui_extras", "poll-promise", "walkers"]
 web = ["gui", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "console_error_panic_hook", "getrandom"]
 
 [[bin]]
 name = "route-eta"
 path = "src/bin/route_eta.rs"
+
+[[bin]]
+name = "route-snapshot"
+path = "src/bin/route_snapshot.rs"
 
 [[bin]]
 name = "ai-isochrone-gui"
