@@ -138,11 +138,11 @@ mod tests {
         use chrono::Utc;
 
         let start = Point::new(47.55, -3.48);
-        let dest = Point::new(60.39, 5.32);
+        let dest = Point::new(62.39, 17.31);
         let config = SotaRoutingConfig::route_only(IsochroneConfig {
             start,
             destination: Some(dest),
-            time_limit_hours: 350.0,
+            time_limit_hours: 400.0,
             ..Default::default()
         });
         let r = calculate_sota_routing(
@@ -164,6 +164,6 @@ mod tests {
             );
         }
         let tacks = r.route_legs.iter().filter(|l| l.is_tack).count();
-        assert!(tacks > 10, "expected tacking on Lorient-Bergen, got {tacks} tacks");
+        assert!(tacks > 10, "expected tacking on Lorient-Sundsvall, got {tacks} tacks");
     }
 }

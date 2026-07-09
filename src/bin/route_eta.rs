@@ -13,10 +13,10 @@ fn weather_seed() -> u64 {
 
 fn main() {
     let start = Point::new(47.55, -3.48);
-    let dest = Point::new(60.39, 5.32); // Bergen
+    let dest = Point::new(62.39, 17.31); // Sundsvall
     let direct_nm = start.distance_to(&dest) / 1852.0;
 
-    println!("Lorient (south of Groix) → Bergen");
+    println!("Lorient (south of Groix) → Sundsvall");
     println!("Direct rhumb: {:.0} nm", direct_nm);
     let seed = std::env::var("AI_ISOCHRONE_WEATHER_SEED")
         .ok()
@@ -27,7 +27,7 @@ fn main() {
     let config = SotaRoutingConfig::route_only(IsochroneConfig {
         start,
         destination: Some(dest),
-        time_limit_hours: 350.0,
+        time_limit_hours: 400.0,
         ..Default::default()
     });
 
@@ -71,7 +71,7 @@ fn main() {
     let passage_nm = direct_nm * 1.18;
     let realistic_h = passage_nm / 6.5;
 
-    println!("\nRouter did not reach Bergen in {:.0} h.", time_limit_hours);
+    println!("\nRouter did not reach Sundsvall in {:.0} h.", time_limit_hours);
     println!("Estimates with default polar + {:.0} kn W wind:", wind.speed * 1.944);
     println!("  Optimistic (max speed, straight line): {:.0} h ({:.1} days)", optimistic_h, optimistic_h / 24.0);
     println!("  Direct rhumb at {:.1} kt: {:.0} h ({:.1} days)", spd_kt, rhumb_h, rhumb_h / 24.0);

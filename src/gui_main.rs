@@ -9,9 +9,9 @@ struct Args {
     start_lat: f64,
     #[arg(long, default_value_t = -3.48)]
     start_lon: f64,
-    #[arg(long, default_value_t = 60.39)]
+    #[arg(long, default_value_t = 62.39)]
     dest_lat: f64,
-    #[arg(long, default_value_t = 5.32)]
+    #[arg(long, default_value_t = 17.31)]
     dest_lon: f64,
     #[arg(long, default_value_t = 12.0)]
     time_limit_hours: f64,

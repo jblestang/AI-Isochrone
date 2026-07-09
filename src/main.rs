@@ -16,11 +16,11 @@ struct Args {
     start_lon: f64,
 
     /// Latitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 60.39)]
+    #[arg(long, default_value_t = 62.39)]
     dest_lat: f64,
 
     /// Longitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 5.32)]
+    #[arg(long, default_value_t = 17.31)]
     dest_lon: f64,
 
     /// Temps limite en heures
