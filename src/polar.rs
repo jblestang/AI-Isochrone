@@ -162,9 +162,11 @@ impl Polar for SimplePolar {
     }
 }
 
-/// Minimum angle au vent (no-go zone). Below this the boat cannot make way.
+/// Minimum angle au vent (no-go zone). Polars are zero for TWA strictly below 30°.
 pub const MIN_ANGLE_AU_VENT_DEG: f64 = 30.0;
-/// Retourne l'angle au vent en degrés (0-180)
+
+/// Calcule l'angle au vent à partir du cap du bateau et de la direction du vent.
+/// Retourne l'angle au vent en degrés (0-180).
 pub fn angle_au_vent(boat_heading: f64, wind_direction: f64) -> f64 {
     let diff = (boat_heading - wind_direction).abs() % 360.0;
     diff.min(360.0 - diff).min(180.0)
