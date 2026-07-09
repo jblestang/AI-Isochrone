@@ -40,26 +40,34 @@ impl Landmask {
     }
 
     pub fn are_land(&self, points: &[Point]) -> Vec<bool> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use rayon::prelude::*;
-            points.par_iter().map(|p| self.is_land(p)).collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
+        if points.len() <= 32 {
             points.iter().map(|p| self.is_land(p)).collect()
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use rayon::prelude::*;
+                points.par_iter().map(|p| self.is_land(p)).collect()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                points.iter().map(|p| self.is_land(p)).collect()
+            }
         }
     }
 
     pub fn are_sea(&self, points: &[Point]) -> Vec<bool> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use rayon::prelude::*;
-            points.par_iter().map(|p| self.is_sea(p)).collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
+        if points.len() <= 32 {
             points.iter().map(|p| self.is_sea(p)).collect()
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use rayon::prelude::*;
+                points.par_iter().map(|p| self.is_sea(p)).collect()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                points.iter().map(|p| self.is_sea(p)).collect()
+            }
         }
     }
 }

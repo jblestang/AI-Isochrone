@@ -1,6 +1,5 @@
 use crate::constraints::{optimistic_eta_hours, violates_constraints};
 use crate::envelope::{build_arrival_envelopes, simplify_envelope_boundary};
-use crate::geometry::*;
 use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use crate::grib::GribProvider;
 use crate::landmask::Landmask;
@@ -93,6 +92,16 @@ struct EnvSnapshot {
     wind: Wind,
     current: Current,
     sea_state: SeaState,
+    current_vx: f64,
+    current_vy: f64,
+}
+
+/// Precomputed boat speed + heading trig for one compass direction.
+#[derive(Clone, Copy)]
+struct HeadingKinematics {
+    boat_speed: f64,
+    sin_h: f64,
+    cos_h: f64,
 }
 
 /// Lightweight successor for layer merge (Copy — no clone in fold/reduce).
@@ -103,6 +112,7 @@ struct SuccCandidate {
     heading: f64,
     time: f64,
     cost: CostComponents,
+    dist_from_start: f64,
 }
 
 struct LayerExpansion {
@@ -146,6 +156,8 @@ struct SotaNode {
     parent_key: Option<NodeKey>,
     /// Precomputed spatial hash key (avoids haversine in merge).
     cell_key: NodeKey,
+    /// Accumulated hop distance from start (for fast grid precision without haversine).
+    dist_from_start: f64,
 }
 
 impl PartialEq for SotaNode {
@@ -256,6 +268,7 @@ impl SotaIsochroneRouter {
             cost: CostComponents::default(),
             parent_key: None,
             cell_key: start_key,
+            dist_from_start: 0.0,
         };
         let mut layer = vec![start_node];
         cells.insert(
@@ -289,6 +302,8 @@ impl SotaIsochroneRouter {
             .collect();
 
         let env = self.resolve_env(base.start);
+        let time_invariant = self.grib.is_time_invariant();
+        let cached_kinematics = self.build_heading_kinematics(&headings, &env);
 
         let profile_on = ProfileCounters::enabled();
         let profile = Arc::new(ProfileCounters::default());
@@ -307,6 +322,14 @@ impl SotaIsochroneRouter {
             }
 
             let prune_before = best_arrival_time;
+            let layer_kinematics;
+            let heading_kinematics: &[HeadingKinematics] = if time_invariant {
+                &cached_kinematics
+            } else {
+                layer_kinematics =
+                    self.build_heading_kinematics(&headings, &self.resolve_env(layer[0].point));
+                &layer_kinematics
+            };
             let t_expand = Instant::now();
             let profile_ref = Arc::clone(&profile);
             let expansions: Vec<LayerExpansion> = layer
@@ -315,6 +338,7 @@ impl SotaIsochroneRouter {
                     self.expand_layer_node(
                         node,
                         &headings,
+                        &heading_kinematics,
                         step_seconds,
                         time_limit,
                         dest,
@@ -325,6 +349,32 @@ impl SotaIsochroneRouter {
                     )
                 })
                 .collect();
+
+            // One batched landmask pass per layer (~80k points) instead of ~10k nested rayon jobs.
+            let all_succ_points: Vec<Point> = expansions
+                .iter()
+                .flat_map(|exp| exp.successors.iter().map(|s| s.point))
+                .collect();
+            if profile_on {
+                profile
+                    .landmask
+                    .fetch_add(all_succ_points.len(), Ordering::Relaxed);
+            }
+            let are_sea = self.landmask.are_sea(&all_succ_points);
+            let mut sea_idx = 0usize;
+            let mut expansions = expansions;
+            for exp in &mut expansions {
+                exp.successors.retain(|_| {
+                    let keep = are_sea[sea_idx];
+                    sea_idx += 1;
+                    keep
+                });
+                if profile_on {
+                    profile
+                        .succ_kept
+                        .fetch_add(exp.successors.len(), Ordering::Relaxed);
+                }
+            }
             expand_wall += t_expand.elapsed();
 
             let t_merge = Instant::now();
@@ -385,6 +435,7 @@ impl SotaIsochroneRouter {
                     cost: succ.cost,
                     parent_key: Some(parent_key),
                     cell_key: skey,
+                    dist_from_start: succ.dist_from_start,
                 });
             }
             merge_wall += t_merge.elapsed();
@@ -490,20 +541,45 @@ impl SotaIsochroneRouter {
     }
 
     fn resolve_env(&self, at: Point) -> EnvSnapshot {
-        if self.grib.is_time_invariant() {
+        let (wind, current, sea_state) = if self.grib.is_time_invariant() {
             let (wind, current, sea_state) = self.grib.get_environment(&at, self.start_time);
-            EnvSnapshot {
-                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
-                current: current.unwrap_or(Current::new(90.0, 0.5)),
-                sea_state: sea_state.unwrap_or(SeaState::new(1.0, 8.0, 270.0)),
-            }
+            (
+                wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current.unwrap_or(Current::new(90.0, 0.5)),
+                sea_state.unwrap_or(SeaState::new(1.0, 8.0, 270.0)),
+            )
         } else {
-            EnvSnapshot {
-                wind: Wind::new(270.0, 10.0),
-                current: Current::new(90.0, 0.5),
-                sea_state: SeaState::new(1.0, 8.0, 270.0),
-            }
+            (
+                Wind::new(270.0, 10.0),
+                Current::new(90.0, 0.5),
+                SeaState::new(1.0, 8.0, 270.0),
+            )
+        };
+        let current_dir_rad = current.direction.to_radians();
+        EnvSnapshot {
+            wind,
+            current,
+            sea_state,
+            current_vx: current.speed * current_dir_rad.sin(),
+            current_vy: current.speed * current_dir_rad.cos(),
         }
+    }
+
+    fn build_heading_kinematics(&self, headings: &[f64], env: &EnvSnapshot) -> Vec<HeadingKinematics> {
+        headings
+            .iter()
+            .map(|&heading| {
+                let angle = angle_au_vent(heading, env.wind.direction);
+                let base_speed = self.polar.speed_ms(angle, env.wind.speed);
+                let factor = self.sea_modifier.speed_factor(angle, &env.sea_state);
+                let h_rad = heading.to_radians();
+                HeadingKinematics {
+                    boat_speed: base_speed * factor,
+                    sin_h: h_rad.sin(),
+                    cos_h: h_rad.cos(),
+                }
+            })
+            .collect()
     }
 
     fn env_at(&self, point: Point, time: f64, cached: EnvSnapshot) -> EnvSnapshot {
@@ -512,10 +588,14 @@ impl SotaIsochroneRouter {
         } else {
             let t = self.start_time + ChronoDuration::seconds(time as i64);
             let (wind, current, sea_state) = self.grib.get_environment(&point, t);
+            let current = current.unwrap_or(cached.current);
+            let current_dir_rad = current.direction.to_radians();
             EnvSnapshot {
                 wind: wind.unwrap_or(cached.wind),
-                current: current.unwrap_or(cached.current),
+                current,
                 sea_state: sea_state.unwrap_or(cached.sea_state),
+                current_vx: current.speed * current_dir_rad.sin(),
+                current_vy: current.speed * current_dir_rad.cos(),
             }
         }
     }
@@ -524,6 +604,7 @@ impl SotaIsochroneRouter {
         &self,
         node: &SotaNode,
         headings: &[f64],
+        heading_kinematics: &[HeadingKinematics],
         step_seconds: f64,
         time_limit: f64,
         dest: Option<Point>,
@@ -550,13 +631,6 @@ impl SotaIsochroneRouter {
             }
         }
 
-        if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
-            if let Some(p) = profile {
-                p.landmask.fetch_add(1, Ordering::Relaxed);
-            }
-            return None;
-        }
-
         let key = node.cell_key;
         let env = self.env_at(node.point, node.time, *cached_env);
 
@@ -564,21 +638,9 @@ impl SotaIsochroneRouter {
             return None;
         }
 
-        let raw_successors: Vec<SuccCandidate> = headings
-            .iter()
-            .filter_map(|&heading| {
-                self.expand_heading(
-                    node,
-                    heading,
-                    step_seconds,
-                    time_limit,
-                    &env,
-                    track_cost,
-                )
-            })
-            .collect();
-
-        if raw_successors.is_empty() {
+        let max_distance = self.config.base.max_distance_meters;
+        let new_time = node.time + step_seconds;
+        if new_time > time_limit {
             let arrival = self.arrival_record(node, key, dest);
             return Some(LayerExpansion {
                 key,
@@ -590,20 +652,37 @@ impl SotaIsochroneRouter {
             });
         }
 
-        let points: Vec<Point> = raw_successors.iter().map(|s| s.point).collect();
+        let mut successors = Vec::with_capacity(headings.len());
+        for (i, &heading) in headings.iter().enumerate() {
+            if let Some(succ) = self.expand_heading(
+                node,
+                heading,
+                heading_kinematics[i],
+                step_seconds,
+                new_time,
+                max_distance,
+                &env,
+                track_cost,
+            ) {
+                successors.push(succ);
+            }
+        }
+
         if let Some(p) = profile {
             p.expansions.fetch_add(1, Ordering::Relaxed);
-            p.succ_raw.fetch_add(raw_successors.len(), Ordering::Relaxed);
-            p.landmask.fetch_add(points.len(), Ordering::Relaxed);
+            p.succ_raw.fetch_add(successors.len(), Ordering::Relaxed);
         }
-        let are_sea = self.landmask.are_sea(&points);
-        let successors: Vec<SuccCandidate> = raw_successors
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, s)| are_sea.get(i).copied().unwrap_or(false).then_some(s))
-            .collect();
-        if let Some(p) = profile {
-            p.succ_kept.fetch_add(successors.len(), Ordering::Relaxed);
+
+        if successors.is_empty() {
+            let arrival = self.arrival_record(node, key, dest);
+            return Some(LayerExpansion {
+                key,
+                point: node.point,
+                heading: node.heading,
+                time: node.time,
+                successors: Vec::new(),
+                arrival,
+            });
         }
 
         let arrival = self.arrival_record(node, key, dest);
@@ -636,36 +715,35 @@ impl SotaIsochroneRouter {
         &self,
         node: &SotaNode,
         heading: f64,
+        kin: HeadingKinematics,
         step_seconds: f64,
-        time_limit: f64,
+        new_time: f64,
+        max_distance: f64,
         env: &EnvSnapshot,
         track_cost: bool,
     ) -> Option<SuccCandidate> {
-        let base = &self.config.base;
-        let angle = angle_au_vent(heading, env.wind.direction);
-        let base_speed = self.polar.speed_ms(angle, env.wind.speed);
-        let factor = self.sea_modifier.speed_factor(angle, &env.sea_state);
-        let boat_speed = base_speed * factor;
-
-        if boat_speed < 0.05 {
+        if kin.boat_speed < 0.05 {
             return None;
         }
 
-        let (eff_speed, eff_dir) =
-            calculate_effective_velocity(boat_speed, heading, &env.current);
+        let boat_vx = kin.boat_speed * kin.sin_h;
+        let boat_vy = kin.boat_speed * kin.cos_h;
+        let eff_vx = boat_vx + env.current_vx;
+        let eff_vy = boat_vy + env.current_vy;
+        let eff_speed = (eff_vx * eff_vx + eff_vy * eff_vy).sqrt();
+        if eff_speed < 0.05 {
+            return None;
+        }
+
         let distance = eff_speed * step_seconds;
-
-        if distance > base.max_distance_meters {
+        if distance > max_distance {
             return None;
         }
 
-        let new_time = node.time + step_seconds;
-        if new_time > time_limit {
-            return None;
-        }
-
-        let new_point = move_from_point(&node.point, eff_dir, distance);
-        let cell_key = self.point_key(&new_point);
+        let eff_dir = eff_vx.atan2(eff_vy).to_degrees().rem_euclid(360.0);
+        let new_point = crate::geometry::move_from_point_fast(&node.point, eff_dir, distance);
+        let dist_from_start = node.dist_from_start + distance;
+        let cell_key = point_key_from_dist(&new_point, dist_from_start);
 
         let cost = if track_cost {
             let step = step_cost(
@@ -691,22 +769,13 @@ impl SotaIsochroneRouter {
             heading,
             cost,
             cell_key,
+            dist_from_start,
         })
     }
 
     fn point_key(&self, point: &Point) -> NodeKey {
         let distance = self.config.base.start.distance_to(point);
-        let precision = if distance < 50_000.0 {
-            0.0063
-        } else if distance < 200_000.0 {
-            0.0081
-        } else {
-            0.0099
-        };
-        (
-            (point.lat / precision).round() as i32,
-            (point.lon / precision).round() as i32,
-        )
+        point_key_from_dist(point, distance)
     }
 
     fn reconstruct_best_route(
@@ -768,6 +837,26 @@ impl SotaIsochroneRouter {
 
         (best_route, Some(eta), Some(cost), legs)
     }
+}
+
+#[inline]
+fn grid_precision_for_dist(dist_m: f64) -> f64 {
+    if dist_m < 50_000.0 {
+        0.0063
+    } else if dist_m < 200_000.0 {
+        0.0081
+    } else {
+        0.0099
+    }
+}
+
+#[inline]
+fn point_key_from_dist(point: &Point, dist_from_start: f64) -> NodeKey {
+    let precision = grid_precision_for_dist(dist_from_start);
+    (
+        (point.lat / precision).round() as i32,
+        (point.lon / precision).round() as i32,
+    )
 }
 
 #[inline]
