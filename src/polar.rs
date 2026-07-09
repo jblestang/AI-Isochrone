@@ -40,8 +40,8 @@ impl SimplePolar {
     /// Crée une polaire par défaut pour un voilier type (exemple)
     /// Cette polaire est un exemple simplifié et devrait être remplacée par des données réelles
     pub fn default_voilier() -> Self {
-        // Angles au vent: 0° (au près), 45°, 60°, 90°, 120°, 135°, 150°, 180° (vent arrière)
-        let angles = vec![0.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0, 180.0];
+        // Angles au vent: 30° (no-go limit), 45°, 60°, 90°, 120°, 135°, 150°, 180° (vent arrière)
+        let angles = vec![30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0, 180.0];
         
         // Forces de vent en m/s: 2.5, 5, 7.5, 10, 12.5, 15 m/s (~5, 10, 15, 20, 25, 30 nœuds)
         let wind_speeds = vec![2.5, 5.0, 7.5, 10.0, 12.5, 15.0];
@@ -50,13 +50,13 @@ impl SimplePolar {
         // IMPORTANT: Le nombre de lignes doit correspondre exactement au nombre d'éléments dans wind_speeds
         // Exemple simplifié: plus rapide au largue, limité au près et vent arrière
         let speed_table = vec![
-            // 0°  45°  60°   90°  120° 135° 150° 180°
-            vec![2.0, 4.0, 5.0, 6.0, 7.0, 6.5, 5.5, 4.0], // 2.5 m/s (index 0)
-            vec![3.0, 5.5, 6.5, 8.0, 9.5, 9.0, 7.5, 5.5], // 5.0 m/s (index 1)
-            vec![4.0, 6.5, 8.0, 9.5, 11.0, 10.5, 9.0, 6.5], // 7.5 m/s (index 2)
-            vec![4.5, 7.5, 9.0, 10.5, 12.0, 11.5, 10.0, 7.0], // 10.0 m/s (index 3)
-            vec![5.0, 8.0, 9.5, 11.0, 12.5, 12.0, 10.5, 7.5], // 12.5 m/s (index 4)
-            vec![5.5, 8.5, 10.0, 11.5, 13.0, 12.5, 11.0, 8.0], // 15.0 m/s (index 5)
+            // 30° 45°  60°   90°  120° 135° 150° 180°
+            vec![0.0, 4.0, 5.0, 6.0, 7.0, 6.5, 5.5, 4.0], // 2.5 m/s (index 0)
+            vec![0.0, 5.5, 6.5, 8.0, 9.5, 9.0, 7.5, 5.5], // 5.0 m/s (index 1)
+            vec![0.0, 6.5, 8.0, 9.5, 11.0, 10.5, 9.0, 6.5], // 7.5 m/s (index 2)
+            vec![0.0, 7.5, 9.0, 10.5, 12.0, 11.5, 10.0, 7.0], // 10.0 m/s (index 3)
+            vec![0.0, 8.0, 9.5, 11.0, 12.5, 12.0, 10.5, 7.5], // 12.5 m/s (index 4)
+            vec![0.0, 8.5, 10.0, 11.5, 13.0, 12.5, 11.0, 8.0], // 15.0 m/s (index 5)
         ];
         
         Self::new(angles, wind_speeds, speed_table)
@@ -163,7 +163,7 @@ impl Polar for SimplePolar {
 }
 
 /// Minimum angle au vent (no-go zone). Below this the boat cannot make way.
-pub const MIN_ANGLE_AU_VENT_DEG: f64 = 35.0;
+pub const MIN_ANGLE_AU_VENT_DEG: f64 = 30.0;
 /// Retourne l'angle au vent en degrés (0-180)
 pub fn angle_au_vent(boat_heading: f64, wind_direction: f64) -> f64 {
     let diff = (boat_heading - wind_direction).abs() % 360.0;
@@ -215,9 +215,9 @@ mod tests {
     #[test]
     fn no_go_zone_returns_zero_speed() {
         let polar = SimplePolar::default_voilier();
-        assert_eq!(polar.speed_knots(10.0, 10.0), 0.0);
-        assert_eq!(polar.speed_knots(34.0, 10.0), 0.0);
-        assert!(polar.speed_ms(40.0, 10.0) > 0.05);
+        assert_eq!(polar.speed_knots(20.0, 10.0), 0.0);
+        assert_eq!(polar.speed_knots(29.0, 10.0), 0.0);
+        assert!(polar.speed_ms(35.0, 10.0) > 0.05);
     }
 
     #[test]
