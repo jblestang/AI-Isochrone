@@ -1,8 +1,7 @@
-use crate::geometry::angle_difference;
+use crate::polar::is_tack_or_gybe;
 use crate::types::{Point, RouteLeg, Wind, SeaState};
 
 const METERS_PER_NM: f64 = 1852.0;
-const TACK_THRESHOLD_DEG: f64 = 35.0;
 
 /// Backtrack from arrival cell key through parent map to start.
 pub fn backtrack_route<S1, S2>(
@@ -50,11 +49,11 @@ pub fn build_route_legs(
         let dist_nm = from.distance_to(&to) / METERS_PER_NM;
         let prev_heading = headings.get(i).copied().unwrap_or(bearing);
         let next_heading = headings.get(i + 1).copied().unwrap_or(bearing);
-        let is_tack = angle_difference(prev_heading, next_heading).abs() > TACK_THRESHOLD_DEG;
         let (wind, sea) = wind_samples
             .get(i)
             .copied()
             .unwrap_or((Wind::new(0.0, 0.0), SeaState::default()));
+        let is_tack = is_tack_or_gybe(prev_heading, next_heading, wind.direction);
         legs.push(RouteLeg {
             from,
             to,

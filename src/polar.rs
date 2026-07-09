@@ -177,6 +177,32 @@ pub fn angle_au_vent(boat_heading: f64, wind_direction: f64) -> f64 {
     diff.min(360.0 - diff).min(180.0)
 }
 
+/// Signed angle from wind direction to boat heading in (-180, 180].
+/// Positive = wind on starboard, negative = wind on port.
+pub fn signed_wind_side(boat_heading: f64, wind_direction: f64) -> f64 {
+    let diff = (boat_heading - wind_direction).rem_euclid(360.0);
+    if diff > 180.0 {
+        diff - 360.0
+    } else {
+        diff
+    }
+}
+
+/// Minimum heading change to count as a manoeuvre (tack or gybe).
+pub const TACK_GYBE_MIN_HEADING_DELTA_DEG: f64 = 35.0;
+
+/// True when a significant heading change crosses the wind (tack or gybe).
+pub fn is_tack_or_gybe(prev_heading: f64, new_heading: f64, wind_direction: f64) -> bool {
+    use crate::geometry::angle_difference;
+
+    if angle_difference(prev_heading, new_heading).abs() < TACK_GYBE_MIN_HEADING_DELTA_DEG {
+        return false;
+    }
+    let prev_side = signed_wind_side(prev_heading, wind_direction);
+    let next_side = signed_wind_side(new_heading, wind_direction);
+    prev_side.signum() != next_side.signum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +225,28 @@ mod tests {
         let speed = polar.speed_knots(90.0, 5.0);
         assert!(speed > 0.0);
         assert!(speed < 20.0); // Vérification raisonnable
+    }
+
+    #[test]
+    fn tack_crosses_wind_side() {
+        // West wind, tack from NW (starboard) to SW (port)
+        assert!(is_tack_or_gybe(315.0, 225.0, 270.0));
+    }
+
+    #[test]
+    fn bear_away_on_same_tack_is_not_a_manoeuvre() {
+        // West wind, bear away from NW toward N on starboard tack
+        assert!(!is_tack_or_gybe(315.0, 340.0, 270.0));
+    }
+
+    #[test]
+    fn small_heading_adjustment_is_not_a_manoeuvre() {
+        assert!(!is_tack_or_gybe(315.0, 330.0, 270.0));
+    }
+
+    #[test]
+    fn gybe_crosses_wind_side_downwind() {
+        // North wind, gybe from SE to SW
+        assert!(is_tack_or_gybe(135.0, 225.0, 0.0));
     }
 }

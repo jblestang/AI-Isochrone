@@ -1,4 +1,5 @@
 use crate::geometry::angle_difference;
+use crate::polar::is_tack_or_gybe;
 use crate::types::{Current, SeaState, Wind};
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +67,7 @@ pub fn step_cost(
     let _ = weights;
     let wave_risk = wave_risk_score(sea_state, wind) * step_seconds;
     let comfort = comfort_penalty(sea_state, wind, new_heading) * step_seconds;
-    let manoeuvre = manoeuvre_penalty(prev_heading, new_heading) * step_seconds;
+    let manoeuvre = manoeuvre_penalty(prev_heading, new_heading, wind.direction) * step_seconds;
     let safety = safety_margin_penalty(sea_state, current, wind) * step_seconds;
 
     CostComponents {
@@ -104,15 +105,20 @@ fn comfort_penalty(sea_state: &SeaState, wind: &Wind, heading: f64) -> f64 {
     hs * (0.3 * head_sea + 0.7 * beam_factor.max(0.0))
 }
 
-/// Manoeuvre penalty: penalize large heading changes (tacks/gybes).
-fn manoeuvre_penalty(prev_heading: Option<f64>, new_heading: f64) -> f64 {
+/// Manoeuvre penalty: only when the boat tacks or gybes (crosses the wind).
+fn manoeuvre_penalty(
+    prev_heading: Option<f64>,
+    new_heading: f64,
+    wind_direction: f64,
+) -> f64 {
     match prev_heading {
         None => 0.0,
         Some(prev) => {
+            if !is_tack_or_gybe(prev, new_heading, wind_direction) {
+                return 0.0;
+            }
             let delta = angle_difference(prev, new_heading).abs();
-            if delta < 15.0 {
-                0.0
-            } else if delta < 45.0 {
+            if delta < 45.0 {
                 0.01 * delta
             } else {
                 0.02 * delta
@@ -175,5 +181,35 @@ mod tests {
             &weights,
         );
         assert!(rough.total(&weights) > calm.total(&weights));
+    }
+
+    #[test]
+    fn manoeuvre_penalty_only_on_tack_or_gybe() {
+        let weights = ObjectiveWeights::default();
+        let wind = Wind::new(270.0, 10.0);
+        let env = SeaState::default();
+        let current = Current::new(90.0, 0.0);
+
+        let bear_away = step_cost(
+            300.0,
+            Some(315.0),
+            340.0,
+            &wind,
+            &current,
+            &env,
+            &weights,
+        );
+        assert_eq!(bear_away.manoeuvre_penalty, 0.0);
+
+        let tack = step_cost(
+            300.0,
+            Some(315.0),
+            225.0,
+            &wind,
+            &current,
+            &env,
+            &weights,
+        );
+        assert!(tack.manoeuvre_penalty > 0.0);
     }
 }
