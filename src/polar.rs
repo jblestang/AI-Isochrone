@@ -104,6 +104,9 @@ impl SimplePolar {
 impl Polar for SimplePolar {
     fn speed_knots(&self, angle_au_vent: f64, wind_speed_ms: f64) -> f64 {
         let angle = angle_au_vent.min(180.0).max(0.0);
+        if angle < MIN_ANGLE_AU_VENT_DEG {
+            return 0.0;
+        }
         
         // Vérifier que la table a le bon nombre de lignes
         if self.speed_table.len() < self.wind_speeds.len() {
@@ -154,23 +157,13 @@ impl Polar for SimplePolar {
         
         // 2. Interpoler selon la vitesse du vent
         let result = self.interpolate_1d(wind_speed_ms, &self.wind_speeds, &speeds_at_winds);
-        
-        // Debug pour 15 m/s de vent pour diagnostiquer le problème
-        if (wind_speed_ms - 15.0).abs() < 0.5 {
-            let speed_ms = result / 1.944;
-            eprintln!("🐛 Debug polaire: wind={:.1}m/s, angle={:.1}°, speed_knots={:.2}, speed_ms={:.3}", 
-                     wind_speed_ms, angle, result, speed_ms);
-            if speed_ms < 0.1 {
-                eprintln!("   ⚠️  Vitesse trop faible ! Vérifier la polaire pour cet angle.");
-            }
-        }
-        
-        // S'assurer qu'on retourne toujours une valeur positive (au moins 0.1 nœud)
-        result.max(0.1)
+
+        result.max(0.0)
     }
 }
 
-/// Calcule l'angle au vent à partir du cap du bateau et de la direction du vent
+/// Minimum angle au vent (no-go zone). Below this the boat cannot make way.
+pub const MIN_ANGLE_AU_VENT_DEG: f64 = 35.0;
 /// Retourne l'angle au vent en degrés (0-180)
 pub fn angle_au_vent(boat_heading: f64, wind_direction: f64) -> f64 {
     let diff = (boat_heading - wind_direction).abs() % 360.0;
@@ -217,6 +210,14 @@ mod tests {
         
         // Vent de 0°, bateau au 0° -> angle au vent = 0° (vent de face)
         assert!((angle_au_vent(0.0, 0.0) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn no_go_zone_returns_zero_speed() {
+        let polar = SimplePolar::default_voilier();
+        assert_eq!(polar.speed_knots(10.0, 10.0), 0.0);
+        assert_eq!(polar.speed_knots(34.0, 10.0), 0.0);
+        assert!(polar.speed_ms(40.0, 10.0) > 0.05);
     }
 
     #[test]

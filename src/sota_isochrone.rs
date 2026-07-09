@@ -4,8 +4,8 @@ use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use crate::grib::GribProvider;
 use crate::landmask::Landmask;
 use crate::objective::{step_cost, CostComponents, ObjectiveWeights};
-use crate::polar::{angle_au_vent, Polar};
-use crate::route::{build_route_legs, simplify_route};
+use crate::polar::{angle_au_vent, Polar, MIN_ANGLE_AU_VENT_DEG};
+use crate::route::build_route_legs;
 use crate::sea_state::{DefaultSeaStateModifier, SeaStatePolarModifier};
 use crate::types::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -113,6 +113,8 @@ struct SuccCandidate {
     time: f64,
     cost: CostComponents,
     dist_from_start: f64,
+    wind: Wind,
+    sea_state: SeaState,
 }
 
 struct LayerExpansion {
@@ -145,6 +147,8 @@ struct CellRecord {
     point: Point,
     heading: f64,
     parent: Option<NodeKey>,
+    wind: Wind,
+    sea_state: SeaState,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +275,7 @@ impl SotaIsochroneRouter {
             cell_key: start_key,
             dist_from_start: 0.0,
         };
+        let start_env = self.resolve_env(base.start, 0.0);
         let mut layer = vec![start_node];
         cells.insert(
             start_key,
@@ -279,6 +284,8 @@ impl SotaIsochroneRouter {
                 point: base.start,
                 heading: 0.0,
                 parent: None,
+                wind: start_env.wind,
+                sea_state: start_env.sea_state,
             },
         );
         if let Some(t) = tracker.as_mut() {
@@ -408,6 +415,8 @@ impl SotaIsochroneRouter {
                             point: succ.point,
                             heading: succ.heading,
                             parent: Some(exp.key),
+                            wind: succ.wind,
+                            sea_state: succ.sea_state,
                         });
                         if let Some(t) = tracker.as_mut() {
                             t.try_update_sea(succ.point, succ.time);
@@ -471,7 +480,8 @@ impl SotaIsochroneRouter {
         }
 
         let t_back = Instant::now();
-        let (best_route, best_eta_hours, best_cost, route_legs) = self.reconstruct_best_route(
+        let (best_route, best_route_headings, best_eta_hours, best_cost, route_legs) =
+            self.reconstruct_best_route(
             &arrival_records,
             &cells,
             step_hours,
@@ -518,6 +528,7 @@ impl SotaIsochroneRouter {
             isochrones,
             arrival_envelopes,
             best_route,
+            best_route_headings,
             route_legs,
             best_eta_hours,
             best_cost,
@@ -693,19 +704,26 @@ impl SotaIsochroneRouter {
         &self,
         node: &SotaNode,
         heading: f64,
-        kin: HeadingKinematics,
+        _kin: HeadingKinematics,
         step_seconds: f64,
         new_time: f64,
         max_distance: f64,
         env: &EnvSnapshot,
         track_cost: bool,
     ) -> Option<SuccCandidate> {
-        if kin.boat_speed < 0.05 {
+        let angle = angle_au_vent(heading, env.wind.direction);
+        if angle + 1e-6 < MIN_ANGLE_AU_VENT_DEG {
+            return None;
+        }
+        let boat_speed = self.polar.speed_ms(angle, env.wind.speed)
+            * self.sea_modifier.speed_factor(angle, &env.sea_state);
+        if boat_speed < 0.05 {
             return None;
         }
 
-        let boat_vx = kin.boat_speed * kin.sin_h;
-        let boat_vy = kin.boat_speed * kin.cos_h;
+        let h_rad = heading.to_radians();
+        let boat_vx = boat_speed * h_rad.sin();
+        let boat_vy = boat_speed * h_rad.cos();
         let eff_vx = boat_vx + env.current_vx;
         let eff_vy = boat_vy + env.current_vy;
         let eff_speed = (eff_vx * eff_vx + eff_vy * eff_vy).sqrt();
@@ -748,6 +766,8 @@ impl SotaIsochroneRouter {
             cost,
             cell_key,
             dist_from_start,
+            wind: env.wind,
+            sea_state: env.sea_state,
         })
     }
 
@@ -762,9 +782,15 @@ impl SotaIsochroneRouter {
         cells: &FxHashMap<NodeKey, CellRecord>,
         step_hours: f64,
         optimize_cost: bool,
-    ) -> (Option<Vec<Point>>, Option<f64>, Option<f64>, Vec<RouteLeg>) {
+    ) -> (
+        Option<Vec<Point>>,
+        Vec<f64>,
+        Option<f64>,
+        Option<f64>,
+        Vec<RouteLeg>,
+    ) {
         if arrivals.is_empty() {
-            return (None, None, None, Vec::new());
+            return (None, Vec::new(), None, None, Vec::new());
         }
 
         let best = if optimize_cost {
@@ -781,39 +807,19 @@ impl SotaIsochroneRouter {
         let eta = best.1 / 3600.0;
         let cost = best.2;
 
-        let raw_route = backtrack_from_cells(cells, best.0);
-
-        let route = if raw_route.len() > 200 {
-            simplify_route(&raw_route, 200)
-        } else {
-            raw_route
-        };
-
-        let headings: Vec<f64> = route
+        let raw_chain = backtrack_from_cells(cells, best.0);
+        let route: Vec<Point> = raw_chain.iter().map(|c| c.point).collect();
+        let headings: Vec<f64> = raw_chain.iter().map(|c| c.heading).collect();
+        let wind_samples: Vec<(Wind, SeaState)> = raw_chain
             .iter()
-            .filter_map(|p| {
-                let key = self.point_key(p);
-                cells.get(&key).map(|c| c.heading)
-            })
-            .collect();
-
-        let wind_samples: Vec<(Wind, SeaState)> = route
-            .iter()
-            .map(|p| {
-                let t = self.start_time;
-                let (w, _, s) = self.grib.get_environment(p, t);
-                (
-                    w.unwrap_or(Wind::new(270.0, 10.0)),
-                    s.unwrap_or(SeaState::default()),
-                )
-            })
+            .map(|c| (c.wind, c.sea_state))
             .collect();
 
         let legs = build_route_legs(&route, &headings, step_hours, &wind_samples);
 
         let best_route = if route.is_empty() { None } else { Some(route) };
 
-        (best_route, Some(eta), Some(cost), legs)
+        (best_route, headings, Some(eta), Some(cost), legs)
     }
 }
 
@@ -837,23 +843,23 @@ fn point_key_from_dist(point: &Point, dist_from_start: f64) -> NodeKey {
     )
 }
 
-fn backtrack_from_cells(cells: &FxHashMap<NodeKey, CellRecord>, arrival_key: NodeKey) -> Vec<Point> {
-    let mut points = Vec::new();
+fn backtrack_from_cells(cells: &FxHashMap<NodeKey, CellRecord>, arrival_key: NodeKey) -> Vec<CellRecord> {
+    let mut chain = Vec::new();
     let mut current = Some(arrival_key);
     let mut guard = 0usize;
     while let Some(k) = current {
         let Some(cell) = cells.get(&k) else {
             break;
         };
-        points.push(cell.point);
+        chain.push(*cell);
         current = cell.parent;
         guard += 1;
         if guard > 50_000 {
             break;
         }
     }
-    points.reverse();
-    points
+    chain.reverse();
+    chain
 }
 
 /// Public entry point for SOTA routing

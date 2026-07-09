@@ -193,6 +193,8 @@ pub struct RouteLeg {
     pub from: Point,
     pub to: Point,
     pub bearing_deg: f64,
+    /// Boat heading chosen by the router (may differ from track bearing with current).
+    pub boat_heading_deg: f64,
     pub distance_nm: f64,
     pub duration_hours: f64,
     pub is_tack: bool,
@@ -269,6 +271,8 @@ pub struct SotaRoutingResult {
     pub isochrones: Vec<Isochrone>,
     pub arrival_envelopes: Vec<ArrivalEnvelope>,
     pub best_route: Option<Vec<Point>>,
+    /// Boat headings at each point of `best_route` (same length when present).
+    pub best_route_headings: Vec<f64>,
     pub route_legs: Vec<RouteLeg>,
     pub best_eta_hours: Option<f64>,
     pub best_cost: Option<f64>,

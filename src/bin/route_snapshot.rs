@@ -214,10 +214,14 @@ fn render_snapshot(
 
         // True wind along route at simulation time for each 12 h leg
         let eta = result.best_eta_hours.unwrap_or(200.0);
+        let polar = SimplePolar::default_voilier();
         draw_route_wind(
             &mut img,
             &vp,
             route,
+            &result.best_route_headings,
+            &result.route_legs,
+            &polar,
             grib,
             start_time,
             eta,
@@ -240,27 +244,42 @@ fn draw_route_wind(
     img: &mut RgbaImage,
     vp: &Viewport,
     route: &[Point],
+    headings: &[f64],
+    legs: &[RouteLeg],
+    polar: &SimplePolar,
     grib: &SeededWindGribProvider,
     start_time: DateTime<Utc>,
     eta_hours: f64,
 ) {
-    for (point, sim_hours) in samples_along_route(route, eta_hours, ROUTE_WIND_STEP_HOURS) {
-        let sample_time =
-            start_time + chrono::Duration::seconds((sim_hours * 3600.0).round() as i64);
-        let wind = grib
-            .get_wind(&point, sample_time)
-            .unwrap_or(Wind::new(270.0, 10.0));
+    let samples = if legs.is_empty() {
+        samples_along_route_with_heading(route, headings, eta_hours, ROUTE_WIND_STEP_HOURS)
+            .into_iter()
+            .map(|(pt, hdg, h)| (pt, hdg, h, None))
+            .collect::<Vec<_>>()
+    } else {
+        samples_from_route_legs(legs, eta_hours, ROUTE_WIND_STEP_HOURS)
+    };
+
+    for (point, heading, sim_hours, leg_wind) in samples {
+        let wind = if let Some(w) = leg_wind {
+            w
+        } else {
+            let sample_time =
+                start_time + chrono::Duration::seconds((sim_hours * 3600.0).round() as i64);
+            grib
+                .get_wind(&point, sample_time)
+                .unwrap_or(Wind::new(270.0, 10.0))
+        };
+        let twa = polar::angle_au_vent(heading, wind.direction);
+        let boat_kt = polar.speed_ms(twa, wind.speed) * 1.944;
         let color = wind_color_for_time(sim_hours, eta_hours);
         let (mut x, mut y) = vp.project(&point);
-        // Offset label/arrow slightly north-east so they sit beside the red route
         x += 14;
         y -= 10;
         draw_wind_arrow(img, x, y, &wind, color);
         let label = format!(
-            "{:.0}h {:.0}/{:.0}kt",
-            sim_hours,
-            wind.direction,
-            wind.speed * 1.944
+            "{:.0}h TWA {:.0}° boat {:.0}kt",
+            sim_hours, twa, boat_kt
         );
         draw_text(
             img,
@@ -272,24 +291,115 @@ fn draw_route_wind(
     }
 }
 
-fn samples_along_route(route: &[Point], eta_hours: f64, step_hours: f64) -> Vec<(Point, f64)> {
+fn samples_from_route_legs(
+    legs: &[RouteLeg],
+    eta_hours: f64,
+    step_hours: f64,
+) -> Vec<(Point, f64, f64, Option<Wind>)> {
+    if legs.is_empty() || eta_hours <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut h = 0.0;
+    while h <= eta_hours + 1e-3 {
+        if let Some((pt, heading, wind)) = point_on_legs_at_hour(legs, eta_hours, h) {
+            out.push((pt, heading, h, Some(wind)));
+        }
+        h += step_hours;
+    }
+    if out.last().map(|(_, _, th, _)| (*th - eta_hours).abs()) > Some(1.0) {
+        if let Some((pt, heading, wind)) = point_on_legs_at_hour(legs, eta_hours, eta_hours) {
+            out.push((pt, heading, eta_hours, Some(wind)));
+        }
+    }
+    out
+}
+
+fn point_on_legs_at_hour(legs: &[RouteLeg], eta_hours: f64, hour: f64) -> Option<(Point, f64, Wind)> {
+    let target = (hour / eta_hours).clamp(0.0, 1.0) * eta_hours;
+    let mut cum = 0.0;
+    for leg in legs {
+        let end = cum + leg.duration_hours;
+        if target <= end + 1e-6 {
+            let frac = if leg.duration_hours > 0.0 {
+                ((target - cum) / leg.duration_hours).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let pt = interpolate_point(&leg.from, &leg.to, frac);
+            return Some((pt, leg.boat_heading_deg, leg.wind));
+        }
+        cum = end;
+    }
+    legs.last().map(|leg| (leg.to, leg.boat_heading_deg, leg.wind))
+}
+
+fn samples_along_route_with_heading(
+    route: &[Point],
+    headings: &[f64],
+    eta_hours: f64,
+    step_hours: f64,
+) -> Vec<(Point, f64, f64)> {
     if route.is_empty() || eta_hours <= 0.0 {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut h = 0.0;
     while h <= eta_hours + 1e-3 {
-        if let Some(pt) = point_on_route_at_hour(route, eta_hours, h) {
-            out.push((pt, h));
+        if let Some((pt, heading)) = point_and_heading_on_route_at_hour(route, headings, eta_hours, h)
+        {
+            out.push((pt, heading, h));
         }
         h += step_hours;
     }
-    if out.last().map(|(_, th)| (*th - eta_hours).abs()) > Some(1.0) {
-        if let Some(pt) = point_on_route_at_hour(route, eta_hours, eta_hours) {
-            out.push((pt, eta_hours));
+    if out.last().map(|(_, _, th)| (*th - eta_hours).abs()) > Some(1.0) {
+        if let Some((pt, heading)) =
+            point_and_heading_on_route_at_hour(route, headings, eta_hours, eta_hours)
+        {
+            out.push((pt, heading, eta_hours));
         }
     }
     out
+}
+
+fn point_and_heading_on_route_at_hour(
+    route: &[Point],
+    headings: &[f64],
+    eta_hours: f64,
+    hour: f64,
+) -> Option<(Point, f64)> {
+    let point = point_on_route_at_hour(route, eta_hours, hour)?;
+    if route.len() == 1 {
+        return Some((point, headings.first().copied().unwrap_or(0.0)));
+    }
+    let total_dist: f64 = route
+        .windows(2)
+        .map(|seg| seg[0].distance_to(&seg[1]))
+        .sum();
+    if total_dist <= 0.0 {
+        return Some((point, headings.first().copied().unwrap_or(0.0)));
+    }
+    let target_dist = (hour / eta_hours).clamp(0.0, 1.0) * total_dist;
+    let mut cum = 0.0;
+    for (i, seg) in route.windows(2).enumerate() {
+        let seg_len = seg[0].distance_to(&seg[1]);
+        if cum + seg_len >= target_dist - 1e-6 {
+            let heading = headings
+                .get(i + 1)
+                .copied()
+                .unwrap_or_else(|| seg[0].bearing_to(&seg[1]));
+            return Some((point, heading));
+        }
+        cum += seg_len;
+    }
+    let last = route.len() - 1;
+    Some((
+        point,
+        headings
+            .last()
+            .copied()
+            .unwrap_or_else(|| route[last - 1].bearing_to(&route[last])),
+    ))
 }
 
 fn point_on_route_at_hour(route: &[Point], eta_hours: f64, hour: f64) -> Option<Point> {

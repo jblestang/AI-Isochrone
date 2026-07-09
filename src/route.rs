@@ -47,17 +47,20 @@ pub fn build_route_legs(
         let to = points[i + 1];
         let bearing = from.bearing_to(&to);
         let dist_nm = from.distance_to(&to) / METERS_PER_NM;
-        let prev_heading = headings.get(i).copied().unwrap_or(bearing);
-        let next_heading = headings.get(i + 1).copied().unwrap_or(bearing);
+        // Cell heading is stored on the arrival point (heading used on this leg).
+        let boat_heading = headings.get(i + 1).copied().unwrap_or(bearing);
+        let next_leg_heading = headings.get(i + 2).copied().unwrap_or(boat_heading);
         let (wind, sea) = wind_samples
-            .get(i)
+            .get(i + 1)
             .copied()
+            .or_else(|| wind_samples.get(i).copied())
             .unwrap_or((Wind::new(0.0, 0.0), SeaState::default()));
-        let is_tack = is_tack_or_gybe(prev_heading, next_heading, wind.direction);
+        let is_tack = is_tack_or_gybe(boat_heading, next_leg_heading, wind.direction);
         legs.push(RouteLeg {
             from,
             to,
             bearing_deg: bearing,
+            boat_heading_deg: boat_heading,
             distance_nm: dist_nm,
             duration_hours: step_hours,
             is_tack,
@@ -124,5 +127,41 @@ mod tests {
         let route = backtrack_route(start, (2, 2), &parent, &points);
         assert_eq!(route.len(), 3);
         assert_eq!(route[0], start);
+    }
+
+    #[test]
+    fn routed_legs_respect_no_go_zone() {
+        use crate::{
+            calculate_sota_routing, polar, simulation_grib, IsochroneConfig, Landmask,
+            ObjectiveWeights, Polar, SimplePolar, SotaRoutingConfig,
+        };
+        use chrono::Utc;
+
+        let start = Point::new(47.55, -3.48);
+        let dest = Point::new(43.12, 5.93);
+        let config = SotaRoutingConfig::route_only(IsochroneConfig {
+            start,
+            destination: Some(dest),
+            time_limit_hours: 200.0,
+            ..Default::default()
+        });
+        let r = calculate_sota_routing(
+            config,
+            ObjectiveWeights::default(),
+            Landmask::new().unwrap(),
+            Box::new(SimplePolar::default_voilier()),
+            Box::new(simulation_grib(42).with_epoch(Utc::now())),
+            Utc::now(),
+        );
+        for (i, leg) in r.route_legs.iter().enumerate().take(30) {
+            let twa_boat = polar::angle_au_vent(leg.boat_heading_deg, leg.wind.direction);
+            let spd = SimplePolar::default_voilier().speed_ms(twa_boat, leg.wind.speed);
+            assert!(
+                spd >= 0.05,
+                "leg {i} boat TWA {twa_boat} hdg={} wind={} -> {spd} m/s",
+                leg.boat_heading_deg,
+                leg.wind.direction
+            );
+        }
     }
 }
