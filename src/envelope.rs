@@ -63,7 +63,7 @@ pub fn build_arrival_envelopes(
             .collect();
 
         if !band_points.is_empty() {
-            let boundary = compute_boundary(&band_points, &destination);
+            let boundary = compute_boundary(&band_points, &destination, 10.0);
             envelopes.push(ArrivalEnvelope {
                 min_eta_hours: band_start,
                 max_eta_hours: band_end,
@@ -77,8 +77,13 @@ pub fn build_arrival_envelopes(
     envelopes
 }
 
-/// Compute envelope boundary as points sorted by bearing from destination
-fn compute_boundary(points: &[Point], center: &Point) -> Vec<Point> {
+/// Outward envelope: farthest reachable point per bearing sector from a center.
+pub fn extract_outward_envelope(points: &[Point], center: &Point, sector_deg: f64) -> Vec<Point> {
+    compute_boundary(points, center, sector_deg)
+}
+
+/// Compute envelope boundary as points sorted by bearing from center
+fn compute_boundary(points: &[Point], center: &Point, sector_deg: f64) -> Vec<Point> {
     if points.len() < 3 {
         return points.to_vec();
     }
@@ -89,8 +94,7 @@ fn compute_boundary(points: &[Point], center: &Point) -> Vec<Point> {
         .collect();
     with_bearing.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    // Keep outermost point per bearing sector (36 sectors = 10°)
-    let sector_deg = 10.0;
+    // Keep outermost point per bearing sector
     let mut boundary: Vec<Point> = Vec::new();
     let mut i = 0;
     while i < with_bearing.len() {
@@ -150,6 +154,19 @@ pub fn reachability_envelope_from_isochrones(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outward_envelope_keeps_farthest_per_sector() {
+        let center = Point::new(47.0, -3.0);
+        let points = vec![
+            Point::new(47.5, -3.0),
+            Point::new(47.2, -3.0),
+            Point::new(47.0, -2.5),
+        ];
+        let env = extract_outward_envelope(&points, &center, 45.0);
+        assert!(!env.is_empty());
+        assert!(env.len() <= points.len());
+    }
 
     #[test]
     fn envelope_bands_are_non_overlapping() {

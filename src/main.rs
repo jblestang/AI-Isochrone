@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simulation_step_minutes: args.simulation_step_minutes,
         max_distance_meters: 50000.0, // ~50 km max par pas (27 nœuds max)
         num_directions: args.num_directions,
+        ..Default::default()
     };
 
     println!("📍 Point de départ: ({:.2}°, {:.2}°)", config.start.lat, config.start.lon);

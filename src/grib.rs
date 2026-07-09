@@ -2,6 +2,16 @@ use crate::types::{Point, Wind, Current, SeaState};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+/// Regular grid metadata shared with routing (from GRIB lattice).
+#[derive(Debug, Clone, Copy)]
+pub struct GribGridSpec {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
+    pub step_deg: f64,
+}
+
 /// Provider pour obtenir les données météorologiques et océaniques
 /// Interface abstraite pour charger les données depuis des fichiers GRIB ou autres sources
 pub trait GribProvider {
@@ -28,6 +38,11 @@ pub trait GribProvider {
             self.get_current(point, time),
             self.get_sea_state(point, time),
         )
+    }
+    
+    /// Optional regular grid metadata when the provider is lattice-based.
+    fn grid_spec(&self) -> Option<GribGridSpec> {
+        None
     }
     
     /// Obtient le vent et le courant simultanément (optimisation)
@@ -267,6 +282,55 @@ impl BufrGribGridProvider {
         Self::new(cells)
     }
 
+    /// Infer regular grid metadata from synthetic cell layout.
+    pub fn grid_spec(&self) -> Option<GribGridSpec> {
+        if self.cells.is_empty() {
+            return None;
+        }
+
+        let mut min_lat = f64::INFINITY;
+        let mut max_lat = f64::NEG_INFINITY;
+        let mut min_lon = f64::INFINITY;
+        let mut max_lon = f64::NEG_INFINITY;
+        let mut lats: Vec<f64> = Vec::new();
+        let mut lons: Vec<f64> = Vec::new();
+
+        for cell in &self.cells {
+            min_lat = min_lat.min(cell.point.lat);
+            max_lat = max_lat.max(cell.point.lat);
+            min_lon = min_lon.min(cell.point.lon);
+            max_lon = max_lon.max(cell.point.lon);
+            if !lats.iter().any(|&v| (v - cell.point.lat).abs() < 1e-6) {
+                lats.push(cell.point.lat);
+            }
+            if !lons.iter().any(|&v| (v - cell.point.lon).abs() < 1e-6) {
+                lons.push(cell.point.lon);
+            }
+        }
+
+        lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lons.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let step_lat = if lats.len() >= 2 {
+            lats[1] - lats[0]
+        } else {
+            0.5
+        };
+        let step_lon = if lons.len() >= 2 {
+            lons[1] - lons[0]
+        } else {
+            step_lat
+        };
+
+        Some(GribGridSpec {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+            step_deg: step_lat.max(step_lon),
+        })
+    }
+
     fn interpolate_env(&self, point: &Point, time: DateTime<Utc>) -> (Wind, Current, SeaState) {
         let (mut wind, current, mut sea) = self.interpolate_env_static(point);
         // Temporal: wind speed varies ±10% over 24h cycle
@@ -346,6 +410,10 @@ impl BufrGribGridProvider {
 }
 
 impl GribProvider for BufrGribGridProvider {
+    fn grid_spec(&self) -> Option<GribGridSpec> {
+        BufrGribGridProvider::grid_spec(self)
+    }
+
     fn get_wind(&self, point: &Point, time: DateTime<Utc>) -> Option<Wind> {
         Some(self.interpolate_env(point, time).0)
     }

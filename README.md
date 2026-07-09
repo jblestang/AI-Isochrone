@@ -163,8 +163,20 @@ let result = calculate_sota_routing(
 
 ## Architecture
 
+### Grid-based isochrones
+
+Isochrones are computed on a **regular lat/lon grid** aligned with GRIB spacing when available:
+
+1. Precompute sea-only grid cells (land excluded)
+2. Snap each wavefront arrival to the nearest sea grid cell
+3. Keep **one best arrival time** per cell
+4. Extract the **outward envelope** (farthest point per bearing sector from start)
+
+Configure via `IsochroneConfig.grid_step_deg` (optional) and `envelope_sector_deg` (default 10°).
+
 | Module | Role |
 |--------|------|
+| `grid` | GRIB-aligned routing grid, per-cell best ETA, envelope builder |
 | `objective` | J function components & weights |
 | `sea_state` | Polar modification for waves |
 | `sota_isochrone` | Multi-criteria wavefront router |

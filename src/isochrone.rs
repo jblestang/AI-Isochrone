@@ -3,8 +3,9 @@ use crate::geometry::*;
 use crate::landmask::Landmask;
 use crate::polar::*;
 use crate::grib::*;
+use crate::grid::{resolve_grid_spec, CellKey, GridBestTracker, RoutingGrid};
 use chrono::{DateTime, Utc, Duration};
-use std::collections::{HashSet, BinaryHeap};
+use std::collections::{HashMap, BinaryHeap};
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
 // Plus besoin de ConvexHull, on utilise notre propre algorithme
@@ -67,199 +68,107 @@ impl IsochroneCalculator {
         }
     }
 
-    /// Calcule les isochrones depuis le point de départ
+    /// Calcule les isochrones depuis le point de départ (grid-based, outward envelope).
     pub fn calculate(&self) -> Vec<Isochrone> {
-        let mut isochrones = Vec::new();
-        let mut visited = HashSet::new();
+        let time_limit = self.config.time_limit_hours * 3600.0;
+        let _step_seconds = self.config.simulation_step_seconds();
+        let iso_band = self.config.isochrone_step_hours * 3600.0;
+
+        let grid_spec = resolve_grid_spec(
+            self.grib_provider.as_ref(),
+            self.config.start,
+            self.config.destination,
+            self.config.grid_step_deg,
+        );
+        let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
+        let mut tracker = GridBestTracker::new(routing_grid);
+        let grid = tracker.grid().clone();
+
+        let mut visited: HashMap<CellKey, f64> = HashMap::new();
         let mut frontier = BinaryHeap::new();
-        
-        // Point de départ
+
         let start_node = Node {
             point: self.config.start,
             time: 0.0,
             distance: 0.0,
         };
-        
-        // Permettre le point de départ même s'il est sur terre (dans un port)
-        // On va quand même explorer depuis ce point
         frontier.push(start_node);
-        
-        // Temps limite en secondes
-        let time_limit = self.config.time_limit_hours * 3600.0;
-        let step_seconds = self.config.simulation_step_seconds();
-        
-        // Prochain temps d'isochrone
+        let start_cell = grid.cell_key(&self.config.start);
+        visited.insert(start_cell, 0.0);
+        let _ = tracker.try_update(self.config.start, 0.0);
+
+        let mut isochrones = Vec::new();
         let mut next_isochrone_time = self.config.isochrone_step_hours * 3600.0;
-        
-        // Points de l'isochrone actuelle
-        let mut current_isochrone_points = Vec::new();
-        
-        let mut nodes_explored = 0;
-        let mut nodes_skipped_land = 0;
-        let mut nodes_skipped_visited = 0;
-        let mut total_successors = 0;
-        // Limite augmentée pour permettre d'atteindre 24h de simulation
-        // Avec 16 directions, 5 min par pas, 24h = 288 pas = beaucoup de nœuds potentiels
-        // Mais la simplification par clé spatiale réduit significativement ce nombre
-        let max_nodes = 3000000*20; // 3M nœuds pour permettre 24h complètes
-        
-        // Tant qu'il y a des nœuds à explorer
+
+        let max_nodes = 3_000_000;
+        let mut nodes_explored = 0usize;
+
         while let Some(node) = frontier.pop() {
-            // Limite de sécurité
-            if nodes_explored > max_nodes {
-                eprintln!("⚠️  Limite de nœuds atteinte ({}) - arrêt du calcul", max_nodes);
+            if nodes_explored >= max_nodes {
                 break;
             }
-            
             nodes_explored += 1;
-            
-            // Vérifier si on dépasse la limite de temps
+
             if node.time > time_limit {
                 break;
             }
-            
-            // Créer une clé pour le point (arrondi pour éviter les doublons)
-            let key = self.point_key(&node.point);
-            
-            // Si déjà visité, ignorer (on garde le premier qui arrive)
-            if visited.contains(&key) {
-                nodes_skipped_visited += 1;
+
+            let cell_key = grid
+                .nearest_sea_cell(&node.point)
+                .unwrap_or_else(|| grid.cell_key(&node.point));
+            if visited.get(&cell_key).copied().unwrap_or(f64::INFINITY) + 1e-6 < node.time {
                 continue;
             }
-            
-            // Marquer comme visité IMMÉDIATEMENT pour éviter les cycles
-            visited.insert(key);
-            
-            // Pour le point de départ, on permet même s'il est sur terre
-            // Pour les autres points, vérifier si le point est en mer
-            let is_sea = if node.time == 0.0 {
-                true // Permettre le point de départ
-            } else {
-                self.landmask.is_sea(&node.point)
-            };
-            
-            if !is_sea {
-                nodes_skipped_land += 1;
-                // Pour les points sur terre (sauf le départ), ne pas les ajouter aux isochrones
-                // et NE PAS explorer depuis eux pour éviter les cycles
-                if node.time == 0.0 {
-                    // Pour le point de départ, explorer quand même
-                    let successors = self.explore_directions(&node);
-                    total_successors += successors.len();
-                    for successor in successors {
-                        let successor_key = self.point_key(&successor.point);
-                        if !visited.contains(&successor_key) && successor.time <= time_limit {
-                            frontier.push(successor);
-                        }
-                    }
-                }
+            visited.insert(cell_key, node.time);
+
+            if node.time > 0.0 && !grid.is_sea_cell(cell_key) {
                 continue;
             }
-            
-            // Ajouter à l'isochrone actuelle si nécessaire
-            if node.time >= next_isochrone_time - step_seconds {
-                current_isochrone_points.push(node.point);
+
+            if node.time > 0.0 {
+                tracker.try_update(node.point, node.time);
             }
-            
-            // Si on a atteint le temps de l'isochrone suivante, créer l'isochrone
+
             if node.time >= next_isochrone_time {
-                if !current_isochrone_points.is_empty() {
-                    let points_before = current_isochrone_points.len();
-                    isochrones.push(Isochrone {
-                        time_hours: next_isochrone_time / 3600.0,
-                        points: current_isochrone_points.clone(),
-                    });
-                    eprintln!("📊 Isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-                    current_isochrone_points.clear();
+                let iso = tracker.build_isochrone_envelope(
+                    next_isochrone_time,
+                    iso_band,
+                    self.config.start,
+                    self.config.envelope_sector_deg,
+                );
+                if !iso.points.is_empty() {
+                    isochrones.push(iso);
                 }
                 next_isochrone_time += self.config.isochrone_step_hours * 3600.0;
             }
-            
-            // Explorer les directions suivantes
-            let successors = self.explore_directions(&node);
-            total_successors += successors.len();
-            
-            for successor in successors {
-                let successor_key = self.point_key(&successor.point);
-                if !visited.contains(&successor_key) && successor.time <= time_limit {
+
+            for successor in self.explore_directions(&node, &grid) {
+                let Some(skey) = grid.nearest_sea_cell(&successor.point) else {
+                    continue;
+                };
+                if successor.time < visited.get(&skey).copied().unwrap_or(f64::INFINITY) {
                     frontier.push(successor);
                 }
             }
         }
-        
-        // Debug: afficher des statistiques uniquement si limite atteinte ou très peu de résultats
-        if nodes_explored >= max_nodes || (isochrones.is_empty() && nodes_explored > 100) {
-            eprintln!("Debug: nodes_explored={}, nodes_skipped_land={}, nodes_skipped_visited={}, total_successors={}, frontier_size={}, isochrones={}, time_reached={:.1}h", 
-                     nodes_explored, nodes_skipped_land, nodes_skipped_visited, total_successors, frontier.len(), isochrones.len(),
-                     if !isochrones.is_empty() { isochrones.last().unwrap().time_hours } else { 0.0 });
-        }
-        
-        // Ajouter la dernière isochrone si nécessaire
-        if !current_isochrone_points.is_empty() {
-            let points_before = current_isochrone_points.len();
-            isochrones.push(Isochrone {
-                time_hours: next_isochrone_time / 3600.0,
-                points: current_isochrone_points,
-            });
-            eprintln!("📊 Dernière isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-            eprintln!("📊 Dernière isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-        }
-        
-        // Afficher un résumé avant simplification
-        eprintln!("\n📈 Résumé avant simplification :");
-        let points_before: Vec<usize> = isochrones.iter().map(|iso| iso.points.len()).collect();
-        for (idx, (isochrone, &points)) in isochrones.iter().zip(points_before.iter()).enumerate() {
-            eprintln!("  Isochrone {}: {:.1}h - {} points", idx + 1, isochrone.time_hours, points);
-        }
-        
-        // Simplifier chaque isochrone pour ne garder que l'enveloppe extérieure (en parallèle)
-        eprintln!("\n🔄 Simplification des isochrones...");
-        isochrones.par_iter_mut().for_each(|isochrone| {
-            simplify_isochrone(isochrone);
-        });
-        
-        // Afficher les résultats après simplification
-        for (idx, (isochrone, &points_before)) in isochrones.iter().zip(points_before.iter()).enumerate() {
-            let points_after = isochrone.points.len();
-            let reduction_pct = if points_before > 0 {
-                (points_before - points_after) as f64 / points_before as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!("  Isochrone {} ({:.1}h): {} → {} points ({:.1}% de réduction)", 
-                     idx + 1, isochrone.time_hours, points_before, points_after, reduction_pct);
-        }
-        
-        // Afficher un résumé final avec bounding box
-        eprintln!("\n✅ Résumé final :");
-        for (idx, isochrone) in isochrones.iter().enumerate() {
-            if isochrone.points.is_empty() {
-                eprintln!("  Isochrone {} ({:.1}h): 0 points (vide)", idx + 1, isochrone.time_hours);
-                continue;
+
+        if next_isochrone_time <= time_limit + iso_band {
+            let iso = tracker.build_isochrone_envelope(
+                next_isochrone_time,
+                iso_band,
+                self.config.start,
+                self.config.envelope_sector_deg,
+            );
+            if !iso.points.is_empty() {
+                isochrones.push(iso);
             }
-            
-            // Calculer quelques statistiques supplémentaires
-            let min_lat = isochrone.points.iter().map(|p| p.lat).fold(f64::INFINITY, f64::min);
-            let max_lat = isochrone.points.iter().map(|p| p.lat).fold(f64::NEG_INFINITY, f64::max);
-            let min_lon = isochrone.points.iter().map(|p| p.lon).fold(f64::INFINITY, f64::min);
-            let max_lon = isochrone.points.iter().map(|p| p.lon).fold(f64::NEG_INFINITY, f64::max);
-            
-            // Calculer la distance maximale du point de départ
-            let max_distance_from_start = isochrone.points.iter()
-                .map(|p| self.config.start.distance_to(p) / 1000.0) // en km
-                .fold(0.0, f64::max);
-            
-            eprintln!("  Isochrone {} ({:.1}h): {} points | Distance max: {:.1}km | Bbox: Lat[{:.4}, {:.4}] Lon[{:.4}, {:.4}]", 
-                     idx + 1, isochrone.time_hours, isochrone.points.len(), 
-                     max_distance_from_start, min_lat, max_lat, min_lon, max_lon);
         }
-        eprintln!("");
-        
+
         isochrones
     }
 
     /// Explore toutes les directions possibles depuis un nœud
-    fn explore_directions(&self, node: &Node) -> Vec<Node> {
+    fn explore_directions(&self, node: &Node, grid: &RoutingGrid) -> Vec<Node> {
         let step_seconds = self.config.simulation_step_seconds();
         let current_time = self.start_time + Duration::seconds(node.time as i64);
         
@@ -290,17 +199,18 @@ impl IsochroneCalculator {
         if !candidates.is_empty() {
             let candidate_points: Vec<Point> = candidates.iter().map(|n| n.point).collect();
             let are_sea = self.landmask.are_sea(&candidate_points);
-            
-            // Filtrer les candidats qui sont en mer en gardant seulement ceux avec are_sea[idx] == true
+
             candidates = candidates
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, candidate)| {
-                    if are_sea.get(idx).copied().unwrap_or(false) {
-                        Some(candidate)
-                    } else {
-                        None
+                    if grid.nearest_sea_cell(&candidate.point).is_none() {
+                        return None;
                     }
+                    if node.time > 0.0 && !are_sea.get(idx).copied().unwrap_or(false) {
+                        return None;
+                    }
+                    Some(candidate)
                 })
                 .collect();
         }
