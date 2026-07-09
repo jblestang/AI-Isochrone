@@ -151,7 +151,11 @@ impl GridBestTracker {
         if time > 0.0 && !landmask.is_sea(&point) {
             return None;
         }
+        self.try_update_sea(point, time)
+    }
 
+    /// Same as `try_update` but skips landmask (caller already verified sea).
+    pub fn try_update_sea(&mut self, point: Point, time: f64) -> Option<CellKey> {
         let key = self.grid.cell_containing(&point);
         if time + 1e-6 >= self.best_time(key) {
             return None;

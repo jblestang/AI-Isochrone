@@ -11,7 +11,7 @@ use crate::types::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -258,7 +258,8 @@ impl SotaIsochroneRouter {
             None
         };
 
-        let mut cells: FxHashMap<NodeKey, CellRecord> = FxHashMap::default();
+        let mut cells: FxHashMap<NodeKey, CellRecord> =
+            FxHashMap::with_capacity_and_hasher(1_048_576, Default::default());
 
         let start_key = self.point_key(&base.start);
         let start_node = SotaNode {
@@ -309,6 +310,8 @@ impl SotaIsochroneRouter {
         let profile = Arc::new(ProfileCounters::default());
         let mut expand_wall = Duration::ZERO;
         let mut merge_wall = Duration::ZERO;
+        let mut seen_layer =
+            FxHashSet::with_capacity_and_hasher(32_768, Default::default());
 
         while current_time <= time_limit && !layer.is_empty() {
             nodes_explored += layer.len();
@@ -380,12 +383,6 @@ impl SotaIsochroneRouter {
             let t_merge = Instant::now();
 
             for exp in &expansions {
-                if let Some(t) = tracker.as_mut() {
-                    if exp.time > 0.0 {
-                        t.try_update(exp.point, exp.time, &self.landmask);
-                    }
-                }
-
                 if let Some(record) = exp.arrival {
                     arrival_records.push(record);
                     if record.1 < best_arrival_time {
@@ -394,49 +391,38 @@ impl SotaIsochroneRouter {
                 }
             }
 
-            // Per-layer dedupe: fold/reduce raw successors down to unique cells before
-            // touching the global visited map (Copy candidates — no clone in fold/reduce).
-            let layer_candidates: FxHashMap<NodeKey, (NodeKey, SuccCandidate)> = expansions
-                .par_iter()
-                .fold(FxHashMap::default, |mut local, exp| {
-                    for succ in &exp.successors {
-                        insert_layer_candidate(&mut local, succ.cell_key, exp.key, *succ);
-                    }
-                    local
-                })
-                .reduce(FxHashMap::default, merge_layer_candidate_maps);
+            // Layer-local dedupe + global insert in one serial pass (FxHashSet avoids
+            // parallel fold/reduce overhead at ~10k expansions/layer).
+            seen_layer.clear();
+            let mut next_layer: Vec<SotaNode> = Vec::with_capacity(layer.len() * headings.len() / 2);
 
-            let mut next_layer: Vec<SotaNode> = Vec::with_capacity(layer_candidates.len());
-
-            for (skey, (parent_key, succ)) in layer_candidates {
-                use std::collections::hash_map::Entry;
-                match cells.entry(skey) {
-                    Entry::Occupied(e) if succ.time + 1e-6 >= e.get().time => continue,
-                    Entry::Occupied(e) => {
-                        let rec = e.into_mut();
-                        rec.time = succ.time;
-                        rec.point = succ.point;
-                        rec.heading = succ.heading;
-                        rec.parent = Some(parent_key);
+            for exp in &expansions {
+                for succ in &exp.successors {
+                    if !seen_layer.insert(succ.cell_key) {
+                        continue;
                     }
-                    Entry::Vacant(e) => {
+                    use std::collections::hash_map::Entry;
+                    if let Entry::Vacant(e) = cells.entry(succ.cell_key) {
                         e.insert(CellRecord {
                             time: succ.time,
                             point: succ.point,
                             heading: succ.heading,
-                            parent: Some(parent_key),
+                            parent: Some(exp.key),
+                        });
+                        if let Some(t) = tracker.as_mut() {
+                            t.try_update_sea(succ.point, succ.time);
+                        }
+                        next_layer.push(SotaNode {
+                            point: succ.point,
+                            time: succ.time,
+                            heading: succ.heading,
+                            cost: succ.cost,
+                            parent_key: Some(exp.key),
+                            cell_key: succ.cell_key,
+                            dist_from_start: succ.dist_from_start,
                         });
                     }
                 }
-                next_layer.push(SotaNode {
-                    point: succ.point,
-                    time: succ.time,
-                    heading: succ.heading,
-                    cost: succ.cost,
-                    parent_key: Some(parent_key),
-                    cell_key: skey,
-                    dist_from_start: succ.dist_from_start,
-                });
             }
             merge_wall += t_merge.elapsed();
 
@@ -859,25 +845,6 @@ fn point_key_from_dist(point: &Point, dist_from_start: f64) -> NodeKey {
     )
 }
 
-#[inline]
-fn insert_layer_candidate(
-    map: &mut FxHashMap<NodeKey, (NodeKey, SuccCandidate)>,
-    cell_key: NodeKey,
-    parent_key: NodeKey,
-    cand: SuccCandidate,
-) {
-    use std::collections::hash_map::Entry;
-    match map.entry(cell_key) {
-        Entry::Vacant(e) => {
-            e.insert((parent_key, cand));
-        }
-        Entry::Occupied(e) if cand.time < e.get().1.time => {
-            *e.into_mut() = (parent_key, cand);
-        }
-        Entry::Occupied(_) => {}
-    }
-}
-
 fn backtrack_from_cells(cells: &FxHashMap<NodeKey, CellRecord>, arrival_key: NodeKey) -> Vec<Point> {
     let mut points = Vec::new();
     let mut current = Some(arrival_key);
@@ -895,19 +862,6 @@ fn backtrack_from_cells(cells: &FxHashMap<NodeKey, CellRecord>, arrival_key: Nod
     }
     points.reverse();
     points
-}
-
-fn merge_layer_candidate_maps(
-    mut a: FxHashMap<NodeKey, (NodeKey, SuccCandidate)>,
-    b: FxHashMap<NodeKey, (NodeKey, SuccCandidate)>,
-) -> FxHashMap<NodeKey, (NodeKey, SuccCandidate)> {
-    if a.len() < b.len() {
-        return merge_layer_candidate_maps(b, a);
-    }
-    for (k, (pk, cand)) in b {
-        insert_layer_candidate(&mut a, k, pk, cand);
-    }
-    a
 }
 
 /// Public entry point for SOTA routing
