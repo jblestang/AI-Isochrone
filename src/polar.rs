@@ -17,6 +17,7 @@ pub trait Polar {
 
 /// Polaire simple basée sur des tables de valeurs
 /// Utilise une interpolation bilinéaire
+#[derive(Clone)]
 pub struct SimplePolar {
     /// Angles au vent en degrés (clés de la table)
     angles: Vec<f64>,
@@ -60,7 +61,28 @@ impl SimplePolar {
         
         Self::new(angles, wind_speeds, speed_table)
     }
+}
 
+/// Polar scaled by a factor (opponent slower/faster boat).
+#[derive(Clone)]
+pub struct ScaledPolar<P: Polar + Clone> {
+    inner: P,
+    scale: f64,
+}
+
+impl<P: Polar + Clone> ScaledPolar<P> {
+    pub fn new(inner: P, scale: f64) -> Self {
+        Self { inner, scale }
+    }
+}
+
+impl<P: Polar + Clone> Polar for ScaledPolar<P> {
+    fn speed_knots(&self, angle_au_vent: f64, wind_speed_ms: f64) -> f64 {
+        self.inner.speed_knots(angle_au_vent, wind_speed_ms) * self.scale
+    }
+}
+
+impl SimplePolar {
     fn interpolate_1d(&self, x: f64, x_values: &[f64], y_values: &[f64]) -> f64 {
         if x <= x_values[0] {
             return y_values[0];
