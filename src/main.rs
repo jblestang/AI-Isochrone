@@ -8,23 +8,23 @@ use std::time::Instant;
 #[command(about = "Calcul d'isochrones pour bateau avec GRIBS, courants et polaire")]
 struct Args {
     /// Latitude du point de départ
-    #[arg(long, default_value_t = 47.75)]
+    #[arg(long, default_value_t = 47.55)]
     start_lat: f64,
 
     /// Longitude du point de départ
-    #[arg(long, default_value_t = -3.37)]
+    #[arg(long, default_value_t = -3.48)]
     start_lon: f64,
 
     /// Latitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 43.12)]
+    #[arg(long, default_value_t = DEFAULT_TO_LAT)]
     dest_lat: f64,
 
     /// Longitude du point d'arrivée (optionnel)
-    #[arg(long, default_value_t = 5.93)]
+    #[arg(long, default_value_t = DEFAULT_TO_LON)]
     dest_lon: f64,
 
     /// Temps limite en heures
-    #[arg(long, default_value_t = 96.0)]
+    #[arg(long, default_value_t = DEFAULT_TIME_LIMIT_HOURS)]
     time_limit_hours: f64,
 
     /// Pas d'isochrone en heures
@@ -32,16 +32,20 @@ struct Args {
     isochrone_step_hours: f64,
 
     /// Pas de simulation en minutes
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 10.0)]
     simulation_step_minutes: f64,
 
     /// Nombre de directions à explorer
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     num_directions: usize,
 
     /// Fichier de sortie pour les résultats (JSON)
     #[arg(long)]
     output: Option<String>,
+
+    /// Seed for reproducible time-varying wind during the simulation
+    #[arg(long, default_value_t = 42)]
+    weather_seed: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simulation_step_minutes: args.simulation_step_minutes,
         max_distance_meters: 50000.0, // ~50 km max par pas (27 nœuds max)
         num_directions: args.num_directions,
+        ..Default::default()
     };
 
     println!("📍 Point de départ: ({:.2}°, {:.2}°)", config.start.lat, config.start.lon);
@@ -83,11 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Erreur lors du chargement du landmask: {}", e))?;
 
     println!("   - Configuration de la polaire...");
-    let polar: Box<dyn Polar + Send + Sync> = Box::new(polar::SimplePolar::default_voilier());
+    let polar: Box<dyn Polar + Send + Sync> = default_routing_polar();
 
     println!("   - Configuration du provider GRIB...");
-    let grib_provider: Box<dyn GribProvider + Send + Sync> = 
-        Box::new(grib::SimpleGribProvider::default());
+    let start_datetime = Utc::now();
+    let grib_provider: Box<dyn GribProvider + Send + Sync> =
+        Box::new(grib::simulation_grib(args.weather_seed).with_epoch(start_datetime));
+    println!("   - Vent variable (seed {})", args.weather_seed);
 
     let init_time = start_time.elapsed();
     println!("   ✓ Initialisation terminée en {:.2?}\n", init_time);
@@ -95,7 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Calcul des isochrones
     println!("🧮 Calcul des isochrones...");
     let calc_start = Instant::now();
-    let start_datetime = Utc::now();
 
     let isochrones = calculate_isochrones(
         config.clone(),

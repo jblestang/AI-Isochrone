@@ -3,11 +3,24 @@ use crate::geometry::*;
 use crate::landmask::Landmask;
 use crate::polar::*;
 use crate::grib::*;
+use crate::grid::{resolve_grid_spec, GridBestTracker, RoutingGrid};
 use chrono::{DateTime, Utc, Duration};
-use std::collections::{HashSet, BinaryHeap};
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-// Plus besoin de ConvexHull, on utilise notre propre algorithme
+use rustc_hash::FxHashMap;
+
+/// Cached wind/current for time-invariant providers.
+#[derive(Clone, Copy)]
+struct EnvSnapshot {
+    wind: Wind,
+    current: Current,
+}
+
+/// One wavefront node and its successors (parallel layer step).
+struct LayerExpansion {
+    node: Node,
+    successors: Vec<Node>,
+}
 
 /// État d'un nœud dans le graphe d'exploration
 #[derive(Debug, Clone)]
@@ -67,245 +80,202 @@ impl IsochroneCalculator {
         }
     }
 
-    /// Calcule les isochrones depuis le point de départ
+    /// Calcule les isochrones depuis le point de départ (grid-based, outward envelope).
     pub fn calculate(&self) -> Vec<Isochrone> {
-        let mut isochrones = Vec::new();
-        let mut visited = HashSet::new();
-        let mut frontier = BinaryHeap::new();
-        
-        // Point de départ
+        let time_limit = self.config.time_limit_hours * 3600.0;
+        let step_seconds = self.config.simulation_step_seconds();
+        let iso_band = self.config.isochrone_step_hours * 3600.0;
+
+        let grid_spec = resolve_grid_spec(
+            self.grib_provider.as_ref(),
+            self.config.start,
+            self.config.destination,
+            self.config.grid_step_deg,
+        );
+        let routing_grid = RoutingGrid::from_spec(grid_spec, &self.landmask);
+        let mut tracker = GridBestTracker::new(routing_grid);
+
+        let mut visited: FxHashMap<(i32, i32), f64> = FxHashMap::default();
+
         let start_node = Node {
             point: self.config.start,
             time: 0.0,
             distance: 0.0,
         };
-        
-        // Permettre le point de départ même s'il est sur terre (dans un port)
-        // On va quand même explorer depuis ce point
-        frontier.push(start_node);
-        
-        // Temps limite en secondes
-        let time_limit = self.config.time_limit_hours * 3600.0;
-        let step_seconds = self.config.simulation_step_seconds();
-        
-        // Prochain temps d'isochrone
+        let mut layer = vec![start_node];
+        let start_key = self.point_key(&self.config.start);
+        visited.insert(start_key, 0.0);
+        let _ = tracker.try_update(self.config.start, 0.0, &self.landmask);
+
+        let mut isochrones = Vec::new();
         let mut next_isochrone_time = self.config.isochrone_step_hours * 3600.0;
-        
-        // Points de l'isochrone actuelle
-        let mut current_isochrone_points = Vec::new();
-        
-        let mut nodes_explored = 0;
-        let mut nodes_skipped_land = 0;
-        let mut nodes_skipped_visited = 0;
-        let mut total_successors = 0;
-        // Limite augmentée pour permettre d'atteindre 24h de simulation
-        // Avec 16 directions, 5 min par pas, 24h = 288 pas = beaucoup de nœuds potentiels
-        // Mais la simplification par clé spatiale réduit significativement ce nombre
-        let max_nodes = 3000000*20; // 3M nœuds pour permettre 24h complètes
-        
-        // Tant qu'il y a des nœuds à explorer
-        while let Some(node) = frontier.pop() {
-            // Limite de sécurité
-            if nodes_explored > max_nodes {
-                eprintln!("⚠️  Limite de nœuds atteinte ({}) - arrêt du calcul", max_nodes);
+
+        let max_nodes =
+            ((self.config.time_limit_hours * 120_000.0) as usize).clamp(500_000, 25_000_000);
+        let mut nodes_explored = 0usize;
+        let mut current_time = 0.0;
+
+        while current_time <= time_limit && !layer.is_empty() {
+            nodes_explored += layer.len();
+            if nodes_explored >= max_nodes {
                 break;
             }
-            
-            nodes_explored += 1;
-            
-            // Vérifier si on dépasse la limite de temps
-            if node.time > time_limit {
-                break;
-            }
-            
-            // Créer une clé pour le point (arrondi pour éviter les doublons)
-            let key = self.point_key(&node.point);
-            
-            // Si déjà visité, ignorer (on garde le premier qui arrive)
-            if visited.contains(&key) {
-                nodes_skipped_visited += 1;
-                continue;
-            }
-            
-            // Marquer comme visité IMMÉDIATEMENT pour éviter les cycles
-            visited.insert(key);
-            
-            // Pour le point de départ, on permet même s'il est sur terre
-            // Pour les autres points, vérifier si le point est en mer
-            let is_sea = if node.time == 0.0 {
-                true // Permettre le point de départ
-            } else {
-                self.landmask.is_sea(&node.point)
-            };
-            
-            if !is_sea {
-                nodes_skipped_land += 1;
-                // Pour les points sur terre (sauf le départ), ne pas les ajouter aux isochrones
-                // et NE PAS explorer depuis eux pour éviter les cycles
-                if node.time == 0.0 {
-                    // Pour le point de départ, explorer quand même
-                    let successors = self.explore_directions(&node);
-                    total_successors += successors.len();
-                    for successor in successors {
-                        let successor_key = self.point_key(&successor.point);
-                        if !visited.contains(&successor_key) && successor.time <= time_limit {
-                            frontier.push(successor);
-                        }
-                    }
+
+            let layer_env = self.resolve_env(layer[0].point, current_time);
+            let headings = routing_headings(self.config.num_directions, layer_env.wind.direction);
+
+            let expansions: Vec<LayerExpansion> = layer
+                .par_iter()
+                .filter_map(|node| {
+                    self.expand_layer_node(node, &headings, step_seconds, time_limit, layer_env)
+                })
+                .collect();
+
+            let mut next_layer: Vec<Node> =
+                Vec::with_capacity(expansions.len().saturating_mul(6));
+
+            for exp in expansions {
+                if exp.node.time > 0.0 {
+                    tracker.try_update(exp.node.point, exp.node.time, &self.landmask);
                 }
-                continue;
+
+                for successor in exp.successors {
+                    let skey = self.point_key(&successor.point);
+                    if successor.time + 1e-6
+                        >= visited.get(&skey).copied().unwrap_or(f64::INFINITY)
+                    {
+                        continue;
+                    }
+                    visited.insert(skey, successor.time);
+                    next_layer.push(successor);
+                }
             }
-            
-            // Ajouter à l'isochrone actuelle si nécessaire
-            if node.time >= next_isochrone_time - step_seconds {
-                current_isochrone_points.push(node.point);
-            }
-            
-            // Si on a atteint le temps de l'isochrone suivante, créer l'isochrone
-            if node.time >= next_isochrone_time {
-                if !current_isochrone_points.is_empty() {
-                    let points_before = current_isochrone_points.len();
-                    isochrones.push(Isochrone {
-                        time_hours: next_isochrone_time / 3600.0,
-                        points: current_isochrone_points.clone(),
-                    });
-                    eprintln!("📊 Isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-                    current_isochrone_points.clear();
+
+            while next_isochrone_time <= current_time + step_seconds + 1e-6 {
+                let iso = tracker.build_isochrone_envelope(
+                    next_isochrone_time,
+                    iso_band,
+                    self.config.start,
+                    self.config.envelope_sector_deg,
+                );
+                if !iso.points.is_empty() {
+                    isochrones.push(iso);
                 }
                 next_isochrone_time += self.config.isochrone_step_hours * 3600.0;
-            }
-            
-            // Explorer les directions suivantes
-            let successors = self.explore_directions(&node);
-            total_successors += successors.len();
-            
-            for successor in successors {
-                let successor_key = self.point_key(&successor.point);
-                if !visited.contains(&successor_key) && successor.time <= time_limit {
-                    frontier.push(successor);
+                if next_isochrone_time > time_limit + iso_band {
+                    break;
                 }
             }
+
+            layer = next_layer;
+            current_time += step_seconds;
         }
-        
-        // Debug: afficher des statistiques uniquement si limite atteinte ou très peu de résultats
-        if nodes_explored >= max_nodes || (isochrones.is_empty() && nodes_explored > 100) {
-            eprintln!("Debug: nodes_explored={}, nodes_skipped_land={}, nodes_skipped_visited={}, total_successors={}, frontier_size={}, isochrones={}, time_reached={:.1}h", 
-                     nodes_explored, nodes_skipped_land, nodes_skipped_visited, total_successors, frontier.len(), isochrones.len(),
-                     if !isochrones.is_empty() { isochrones.last().unwrap().time_hours } else { 0.0 });
-        }
-        
-        // Ajouter la dernière isochrone si nécessaire
-        if !current_isochrone_points.is_empty() {
-            let points_before = current_isochrone_points.len();
-            isochrones.push(Isochrone {
-                time_hours: next_isochrone_time / 3600.0,
-                points: current_isochrone_points,
-            });
-            eprintln!("📊 Dernière isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-            eprintln!("📊 Dernière isochrone {:.1}h créée : {} points", next_isochrone_time / 3600.0, points_before);
-        }
-        
-        // Afficher un résumé avant simplification
-        eprintln!("\n📈 Résumé avant simplification :");
-        let points_before: Vec<usize> = isochrones.iter().map(|iso| iso.points.len()).collect();
-        for (idx, (isochrone, &points)) in isochrones.iter().zip(points_before.iter()).enumerate() {
-            eprintln!("  Isochrone {}: {:.1}h - {} points", idx + 1, isochrone.time_hours, points);
-        }
-        
-        // Simplifier chaque isochrone pour ne garder que l'enveloppe extérieure (en parallèle)
-        eprintln!("\n🔄 Simplification des isochrones...");
-        isochrones.par_iter_mut().for_each(|isochrone| {
-            simplify_isochrone(isochrone);
-        });
-        
-        // Afficher les résultats après simplification
-        for (idx, (isochrone, &points_before)) in isochrones.iter().zip(points_before.iter()).enumerate() {
-            let points_after = isochrone.points.len();
-            let reduction_pct = if points_before > 0 {
-                (points_before - points_after) as f64 / points_before as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!("  Isochrone {} ({:.1}h): {} → {} points ({:.1}% de réduction)", 
-                     idx + 1, isochrone.time_hours, points_before, points_after, reduction_pct);
-        }
-        
-        // Afficher un résumé final avec bounding box
-        eprintln!("\n✅ Résumé final :");
-        for (idx, isochrone) in isochrones.iter().enumerate() {
-            if isochrone.points.is_empty() {
-                eprintln!("  Isochrone {} ({:.1}h): 0 points (vide)", idx + 1, isochrone.time_hours);
-                continue;
+
+        if next_isochrone_time <= time_limit + iso_band {
+            let iso = tracker.build_isochrone_envelope(
+                next_isochrone_time,
+                iso_band,
+                self.config.start,
+                self.config.envelope_sector_deg,
+            );
+            if !iso.points.is_empty() {
+                isochrones.push(iso);
             }
-            
-            // Calculer quelques statistiques supplémentaires
-            let min_lat = isochrone.points.iter().map(|p| p.lat).fold(f64::INFINITY, f64::min);
-            let max_lat = isochrone.points.iter().map(|p| p.lat).fold(f64::NEG_INFINITY, f64::max);
-            let min_lon = isochrone.points.iter().map(|p| p.lon).fold(f64::INFINITY, f64::min);
-            let max_lon = isochrone.points.iter().map(|p| p.lon).fold(f64::NEG_INFINITY, f64::max);
-            
-            // Calculer la distance maximale du point de départ
-            let max_distance_from_start = isochrone.points.iter()
-                .map(|p| self.config.start.distance_to(p) / 1000.0) // en km
-                .fold(0.0, f64::max);
-            
-            eprintln!("  Isochrone {} ({:.1}h): {} points | Distance max: {:.1}km | Bbox: Lat[{:.4}, {:.4}] Lon[{:.4}, {:.4}]", 
-                     idx + 1, isochrone.time_hours, isochrone.points.len(), 
-                     max_distance_from_start, min_lat, max_lat, min_lon, max_lon);
         }
-        eprintln!("");
-        
+
         isochrones
     }
 
+    fn resolve_env(&self, at: Point, sim_time: f64) -> EnvSnapshot {
+        if self.grib_provider.is_time_invariant() {
+            let (wind, current, _) = self
+                .grib_provider
+                .get_environment(&at, self.start_time);
+            EnvSnapshot {
+                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current: current.unwrap_or(Current::new(90.0, 0.5)),
+            }
+        } else {
+            let t = self.start_time + Duration::seconds(sim_time as i64);
+            let (wind, current, _) = self.grib_provider.get_environment(&at, t);
+            EnvSnapshot {
+                wind: wind.unwrap_or(Wind::new(270.0, 10.0)),
+                current: current.unwrap_or(Current::new(90.0, 0.5)),
+            }
+        }
+    }
+
+    fn env_at(&self, point: Point, time: f64, cached: EnvSnapshot) -> EnvSnapshot {
+        if self.grib_provider.is_time_invariant() {
+            cached
+        } else {
+            self.resolve_env(point, time)
+        }
+    }
+
+    fn expand_layer_node(
+        &self,
+        node: &Node,
+        headings: &[f64],
+        step_seconds: f64,
+        time_limit: f64,
+        cached_env: EnvSnapshot,
+    ) -> Option<LayerExpansion> {
+        if node.time > time_limit {
+            return None;
+        }
+        if node.time > 0.0 && !self.landmask.is_sea(&node.point) {
+            return None;
+        }
+
+        let env = self.env_at(node.point, node.time, cached_env);
+        let successors = self.explore_directions(node, headings, &env.wind, &env.current, step_seconds);
+
+        Some(LayerExpansion {
+            node: node.clone(),
+            successors,
+        })
+    }
+
     /// Explore toutes les directions possibles depuis un nœud
-    fn explore_directions(&self, node: &Node) -> Vec<Node> {
-        let step_seconds = self.config.simulation_step_seconds();
-        let current_time = self.start_time + Duration::seconds(node.time as i64);
-        
-        // Obtenir vent et courant pour ce point à ce temps
-        let (wind_opt, current_opt) = self.grib_provider.get_wind_and_current(
-            &node.point,
-            current_time,
-        );
-        
-        let wind = wind_opt.unwrap_or(Wind::new(270.0, 10.0));
-        let current = current_opt.unwrap_or(Current::new(90.0, 0.5));
-        
-        // Explorer toutes les directions possibles
-        let direction_step = self.config.direction_step_degrees();
-        let directions: Vec<f64> = (0..self.config.num_directions)
-            .map(|i| i as f64 * direction_step)
-            .collect();
-        
-        // Paralléliser l'exploration des directions (sans vérification landmask immédiate)
-        let mut candidates: Vec<Node> = directions
-            .par_iter()
+    fn explore_directions(
+        &self,
+        node: &Node,
+        headings: &[f64],
+        wind: &Wind,
+        current: &Current,
+        step_seconds: f64,
+    ) -> Vec<Node> {
+        let candidates: Vec<Node> = headings
+            .iter()
             .filter_map(|&heading| {
-                self.explore_direction_without_landmask(node, heading, &wind, &current, step_seconds)
+                self.explore_direction_without_landmask(
+                    node,
+                    heading,
+                    wind,
+                    current,
+                    step_seconds,
+                )
             })
             .collect();
-        
-        // Vérifier le landmask en batch pour tous les candidats (parallélisé)
-        if !candidates.is_empty() {
-            let candidate_points: Vec<Point> = candidates.iter().map(|n| n.point).collect();
-            let are_sea = self.landmask.are_sea(&candidate_points);
-            
-            // Filtrer les candidats qui sont en mer en gardant seulement ceux avec are_sea[idx] == true
-            candidates = candidates
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, candidate)| {
-                    if are_sea.get(idx).copied().unwrap_or(false) {
-                        Some(candidate)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+
+        if candidates.is_empty() {
+            return candidates;
         }
-        
+
+        let candidate_points: Vec<Point> = candidates.iter().map(|n| n.point).collect();
+        let are_sea = self.landmask.are_sea(&candidate_points);
+
         candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, candidate)| {
+                if node.time > 0.0 && !are_sea.get(idx).copied().unwrap_or(false) {
+                    return None;
+                }
+                Some(candidate)
+            })
+            .collect()
     }
 
     /// Explore une direction spécifique depuis un nœud (sans vérification landmask)
@@ -318,16 +288,18 @@ impl IsochroneCalculator {
         current: &Current,
         step_seconds: f64,
     ) -> Option<Node> {
-        // Calculer l'angle au vent
-        let angle_au_vent = angle_au_vent(heading, wind.direction);
-        
+        let twa = angle_au_vent(heading, wind.direction);
+        if twa + 1e-6 < crate::polar::MIN_ANGLE_AU_VENT_DEG {
+            return None;
+        }
+
         // Obtenir la vitesse du bateau depuis la polaire
-        let boat_speed_ms = self.polar.speed_ms(angle_au_vent, wind.speed);
+        let boat_speed_ms = self.polar.speed_ms(twa, wind.speed);
         
         // Debug pour diagnostiquer les problèmes de vitesse
         if (wind.speed - 15.0).abs() < 0.5 && boat_speed_ms < 0.1 {
             eprintln!("⚠️  Vitesse très faible détectée: wind={:.1}m/s, angle_au_vent={:.1}°, boat_speed_ms={:.4}m/s", 
-                     wind.speed, angle_au_vent, boat_speed_ms);
+                     wind.speed, twa, boat_speed_ms);
         }
         
         // Si la vitesse est trop faible, ignorer cette direction
@@ -390,6 +362,11 @@ impl IsochroneCalculator {
         let lon_rounded = (point.lon / precision).round() as i32;
         (lat_rounded, lon_rounded)
     }
+}
+
+/// Simplifie une isochrone (public API for SOTA router)
+pub fn simplify_isochrone_public(isochrone: &mut Isochrone) {
+    simplify_isochrone(isochrone);
 }
 
 /// Simplifie une isochrone en éliminant les points trop proches par discrétisation lat/lon
@@ -558,7 +535,7 @@ mod tests {
     fn test_isochrone_calculator() {
         let config = IsochroneConfig::default();
         let landmask = Landmask::new().unwrap();
-        let polar = Box::new(SimplePolar::default_voilier());
+        let polar = default_routing_polar();
         let grib = Box::new(SimpleGribProvider::default());
         let start_time = Utc::now();
         
